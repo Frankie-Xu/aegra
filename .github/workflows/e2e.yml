@@ -6,6 +6,15 @@ on:
   # Allow manual trigger
   workflow_dispatch:
 
+# Workflow-level so pytest steps inherit them: tests that read the database
+# directly fall back to the postgres/postgres defaults without these.
+env:
+  POSTGRES_USER: "user"
+  POSTGRES_PASSWORD: "password"
+  POSTGRES_HOST: "localhost"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "aegra"
+
 jobs:
   e2e-dev-mode:
     name: E2E (Dev Mode — LocalExecutor)
