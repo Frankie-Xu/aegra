@@ -26,6 +26,7 @@ from aegra_api.core.auth_enforcement import (
     build_auth_enforcer,
     reset_dispatch_state,
 )
+from aegra_api.core.database import db_manager
 from aegra_api.models.auth import User
 from tests.fixtures.session_fixtures import ThreadSession, override_session_dependency
 
@@ -239,11 +240,66 @@ def test_cron_create_authorizes_every_layer_of_its_chain(monkeypatch: pytest.Mon
     # Stateless cron create: no thread row needed, and it still walks the full
     # crons.create -> assistants.read -> threads.search chain.
     with TestClient(app, raise_server_exceptions=False) as client:
-        client.post("/runs/crons", json={"assistant_id": "agent", "schedule": "0 0 * * *"})
+        client.post("/runs/crons", json={"assistant_id": "agent", "schedule": "0 0 * * *", "input": {"q": 1}})
 
     assert ("crons", "create") in seen
     assert ("assistants", "read") in seen, "cron create stopped authorizing the assistant"
     assert ("threads", "search") in seen, "cron create stopped authorizing the thread layer"
+
+
+def test_store_get_handler_receives_parsed_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET must dispatch the parsed namespace list, not the raw dot-string.
+
+    Regression for #515: a handler comparing namespace[0] to the user judged
+    ["a.b"] on GET but ["a", "b"] on PUT, denying reads of items it allowed
+    writing.
+    """
+    auth = Auth()
+    seen: list[Any] = []
+
+    @auth.on.store
+    async def record(ctx: Any, value: Any) -> bool:
+        seen.append(value.get("namespace"))
+        return False
+
+    app = _build_app(auth, monkeypatch)
+
+    with TestClient(app) as client:
+        client.get("/store/items", params={"key": "k", "namespace": "a.b"})
+        client.get("/store/items", params=[("key", "k"), ("namespace", "a"), ("namespace", "b")])
+
+    assert seen == [["a", "b"], ["a", "b"]], f"handler saw {seen}; both query forms must dispatch the parsed list"
+
+
+def test_store_get_normalizes_handler_returned_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A namespace the handler returns as a filter is normalized before scoping.
+
+    Handlers may redirect the lookup with {"namespace": "other.place"}; the
+    store must see the split list under the user scope, not the raw string.
+    """
+    auth = Auth()
+
+    @auth.on.store
+    async def redirect(ctx: Any, value: Any) -> dict[str, Any]:
+        return {"namespace": "other.place"}
+
+    app = _build_app(auth, monkeypatch)
+    seen: list[tuple[str, ...]] = []
+
+    class _RecordingStore:
+        async def aget(self, namespace: tuple[str, ...], key: str) -> None:
+            seen.append(namespace)
+            return None
+
+    monkeypatch.setattr(db_manager, "get_store", lambda: _RecordingStore())
+
+    with TestClient(app) as client:
+        response = client.get("/store/items", params={"key": "k", "namespace": "a.b"})
+
+    assert response.status_code == 404, response.text
+    assert seen == [("users", "test-user", "other", "place")], (
+        f"store received {seen}; the handler-returned dot-string must be normalized before scoping"
+    )
 
 
 def test_store_delete_handler_receives_namespace_and_key(monkeypatch: pytest.MonkeyPatch) -> None:
