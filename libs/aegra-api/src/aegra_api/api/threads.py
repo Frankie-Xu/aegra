@@ -18,6 +18,7 @@ from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
 from aegra_api.core.auth_filters import build_metadata_filter
 from aegra_api.core.auth_handlers import build_auth_context, handle_event
+from aegra_api.core.database import db_manager
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import get_session
@@ -35,7 +36,7 @@ from aegra_api.models import (
     ThreadUpdate,
     User,
 )
-from aegra_api.models.errors import CONFLICT, NOT_FOUND
+from aegra_api.models.errors import CONFLICT, NOT_FOUND, AgentProtocolError
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.services.thread_state_service import ThreadStateService
 from aegra_api.utils.run_utils import strip_pinned_config_keys
@@ -821,7 +822,16 @@ async def get_thread_history_get(
     return await get_thread_history_post(thread_id, req, user, session)
 
 
-@router.delete("/threads/{thread_id}", responses={**NOT_FOUND})
+@router.delete(
+    "/threads/{thread_id}",
+    responses={
+        **NOT_FOUND,
+        500: {
+            "model": AgentProtocolError,
+            "description": "Checkpoint cleanup failed; the thread is preserved and the delete can be retried",
+        },
+    },
+)
 async def delete_thread(
     thread_id: str,
     user: User = Depends(get_current_user),
@@ -829,9 +839,9 @@ async def delete_thread(
 ) -> dict[str, str]:
     """Delete a thread by its ID.
 
-    Permanently removes the thread and its metadata. Any active runs on the
-    thread are automatically cancelled before deletion. Checkpoint history
-    stored in the graph backend is not affected.
+    Permanently removes the thread, its metadata, and its checkpoint history
+    stored in the graph backend. Any active runs on the thread are
+    automatically cancelled before deletion.
     """
     # Authorization check
     ctx = build_auth_context(user, "threads", "delete")
@@ -865,6 +875,10 @@ async def delete_thread(
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
+
+    # Checkpoints first: if this fails the thread row survives and the client
+    # can retry; the reverse order would orphan LangGraph checkpoint rows.
+    await db_manager.get_checkpointer().adelete_thread(thread_id)
 
     await session.delete(thread)
     await session.commit()
