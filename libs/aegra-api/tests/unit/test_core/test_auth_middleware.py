@@ -1,6 +1,10 @@
 """Unit tests for auth middleware"""
 
+from __future__ import annotations
+
+import json
 import os
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -9,12 +13,70 @@ from starlette.authentication import AuthCredentials, AuthenticationError
 from starlette.requests import HTTPConnection
 from starlette.responses import JSONResponse
 
+from aegra_api.config import AuthConfig
+from aegra_api.core import auth_middleware as auth_middleware_module
 from aegra_api.core.auth_middleware import (
     LangGraphAuthBackend,
     LangGraphUser,
     get_auth_backend,
+    get_auth_instance,
     on_auth_error,
 )
+
+_COUNTING_AUTH_SOURCE = """\
+from langgraph_sdk import Auth
+
+auth = Auth()
+
+
+@auth.authenticate
+async def authenticate(headers: dict) -> dict:
+    return {
+        "identity": "cached-user",
+        "display_name": "Cached User",
+        "is_authenticated": True,
+        "permissions": ["read"],
+    }
+"""
+
+
+def _install_auth_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Write a custom auth module + aegra.json and chdir so the loader finds them."""
+    auth_file = tmp_path / "counting_auth.py"
+    auth_file.write_text(_COUNTING_AUTH_SOURCE)
+    (tmp_path / "aegra.json").write_text(
+        json.dumps(
+            {
+                "graphs": {"test": "./test.py:graph"},
+                "auth": {"path": "./counting_auth.py:auth"},
+            }
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    return auth_file
+
+
+def _count_spec_from_file_location(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Patch importlib so each auth-file spec creation is recorded."""
+    real_spec_from_file_location = auth_middleware_module.importlib.util.spec_from_file_location
+    locations: list[str] = []
+
+    def counting_spec(
+        name: str,
+        location: str | None = None,
+        *args: object,
+        **kwargs: object,
+    ) -> ModuleSpec | None:
+        if location is not None:
+            locations.append(location)
+        return real_spec_from_file_location(name, location, *args, **kwargs)
+
+    monkeypatch.setattr(
+        auth_middleware_module.importlib.util,
+        "spec_from_file_location",
+        counting_spec,
+    )
+    return locations
 
 
 class TestLangGraphUser:
@@ -412,29 +474,119 @@ class TestLangGraphAuthBackend:
 class TestGetAuthBackend:
     """Test get_auth_backend function"""
 
-    def test_get_auth_backend_noop(self):
+    def test_get_auth_backend_noop(self) -> None:
         """Test getting auth backend with noop type"""
         with patch.dict(os.environ, {"AUTH_TYPE": "noop"}):
             backend = get_auth_backend()
             assert isinstance(backend, LangGraphAuthBackend)
 
-    def test_get_auth_backend_custom(self):
+    def test_get_auth_backend_custom(self) -> None:
         """Test getting auth backend with custom type"""
         with patch.dict(os.environ, {"AUTH_TYPE": "custom"}):
             backend = get_auth_backend()
             assert isinstance(backend, LangGraphAuthBackend)
 
-    def test_get_auth_backend_unknown(self):
+    def test_get_auth_backend_unknown(self) -> None:
         """Test getting auth backend with unknown type"""
         with patch.dict(os.environ, {"AUTH_TYPE": "unknown"}):
             backend = get_auth_backend()
             assert isinstance(backend, LangGraphAuthBackend)
 
-    def test_get_auth_backend_default(self):
+    def test_get_auth_backend_default(self) -> None:
         """Test getting auth backend with no AUTH_TYPE set"""
         with patch.dict(os.environ, {}, clear=True):
             backend = get_auth_backend()
             assert isinstance(backend, LangGraphAuthBackend)
+
+    def test_get_auth_backend_returns_same_instance(self) -> None:
+        """get_auth_backend is a process singleton; repeated calls must not rebuild it."""
+        first = get_auth_backend()
+        second = get_auth_backend()
+        assert first is second
+
+
+class TestAuthModuleLoadOnce:
+    """Custom auth modules must be imported once per config path, not per request."""
+
+    def test_get_auth_backend_loads_auth_file_once(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Repeated get_auth_backend() calls import the auth file a single time."""
+        auth_file = _install_auth_config(tmp_path, monkeypatch)
+        locations = _count_spec_from_file_location(monkeypatch)
+
+        backends = [get_auth_backend() for _ in range(5)]
+
+        assert len({id(backend) for backend in backends}) == 1
+        assert isinstance(backends[0], LangGraphAuthBackend)
+        assert backends[0].auth_instance is not None
+        assert locations == [str(auth_file.resolve())]
+
+    def test_langgraph_auth_backend_init_reuses_cached_module(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Direct backend construction must still reuse the path-keyed module cache."""
+        auth_file = _install_auth_config(tmp_path, monkeypatch)
+        locations = _count_spec_from_file_location(monkeypatch)
+
+        first = LangGraphAuthBackend()
+        second = LangGraphAuthBackend()
+        via_factory = get_auth_backend()
+
+        assert isinstance(via_factory, LangGraphAuthBackend)
+        assert first.auth_instance is not None
+        assert first.auth_instance is second.auth_instance
+        assert first.auth_instance is via_factory.auth_instance
+        assert get_auth_instance() is first.auth_instance
+        assert locations == [str(auth_file.resolve())]
+
+    def test_missing_auth_file_is_not_reprobed_per_init(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A missing auth file is resolved once; later inits reuse that result."""
+        (tmp_path / "aegra.json").write_text(
+            json.dumps(
+                {
+                    "graphs": {"test": "./test.py:graph"},
+                    "auth": {"path": "./does_not_exist.py:auth"},
+                }
+            )
+        )
+        monkeypatch.chdir(tmp_path)
+        config_reads: list[int] = []
+        real_load_auth_config = auth_middleware_module.load_auth_config
+
+        def counting_load_auth_config() -> AuthConfig | None:
+            config_reads.append(1)
+            return real_load_auth_config()
+
+        monkeypatch.setattr(auth_middleware_module, "load_auth_config", counting_load_auth_config)
+
+        first = LangGraphAuthBackend()
+        second = LangGraphAuthBackend()
+
+        assert first.auth_instance is None
+        assert second.auth_instance is None
+        assert len(config_reads) == 1
+
+    @pytest.mark.asyncio
+    async def test_cached_auth_handler_still_authenticates(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Caching the Auth object must not change authenticate() results."""
+        _install_auth_config(tmp_path, monkeypatch)
+
+        backend = get_auth_backend()
+        assert isinstance(backend, LangGraphAuthBackend)
+
+        mock_conn = Mock(spec=HTTPConnection)
+        mock_conn.headers = {"authorization": "Bearer unused"}
+
+        first = await backend.authenticate(mock_conn)
+        second = await get_auth_backend().authenticate(mock_conn)
+
+        assert first is not None and second is not None
+        _, first_user = first
+        _, second_user = second
+        assert first_user.identity == "cached-user"
+        assert second_user.identity == "cached-user"
+        assert first_user.display_name == "Cached User"
 
 
 class TestOnAuthError:
