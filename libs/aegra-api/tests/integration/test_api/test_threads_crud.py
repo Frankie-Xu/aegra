@@ -19,6 +19,7 @@ from tests.fixtures.database import (
     DummySessionBase,
     override_get_session_dep,
 )
+from tests.fixtures.langgraph import make_interrupt, make_snapshot, make_task
 from tests.fixtures.session_fixtures import BasicSession, override_session_dependency
 from tests.fixtures.test_helpers import DummyRun, DummyThread
 
@@ -369,6 +370,10 @@ class TestGetThread:
         data = resp.json()
         assert data["thread_id"] == "test-123"
         assert data["metadata"]["purpose"] == "testing"
+        assert data["values"] == {}
+        assert data["interrupts"] == {}
+        assert data["config"] == {}
+        assert data["state_updated_at"] is None
 
     def test_get_thread_not_found(self):
         """Test getting a non-existent thread"""
@@ -384,6 +389,102 @@ class TestGetThread:
         resp = client.get("/threads/nonexistent")
         assert resp.status_code == 404
         assert "not found" in resp.json()["detail"]
+
+    def test_get_thread_not_found_does_not_load_checkpoint(self) -> None:
+        """404 must not touch the graph/checkpointer path."""
+        app = create_test_app(include_runs=False, include_threads=True)
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> None:
+                return None
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        with patch("aegra_api.services.langgraph_service.get_langgraph_service") as mock_get_service:
+            resp = client.get("/threads/nonexistent")
+
+        assert resp.status_code == 404
+        mock_get_service.assert_not_called()
+
+    def test_get_thread_includes_latest_checkpoint_state_fields(self) -> None:
+        """GET /threads/{id} projects values, interrupts, config, state_updated_at."""
+        app = create_test_app(include_runs=False, include_threads=True)
+        thread = _thread_row("test-123", metadata={"graph_id": "test-graph"})
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> object:
+                return thread
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        interrupt = make_interrupt(value="approve?", interrupt_id="int-1")
+        snapshot = make_snapshot(
+            {"messages": [{"type": "human", "content": "hello"}]},
+            {
+                "configurable": {
+                    "thread_id": "test-123",
+                    "checkpoint_id": "cp-1",
+                    "checkpoint_ns": "",
+                }
+            },
+            created_at="2024-06-01T12:00:00Z",
+            next_nodes=("agent",),
+            tasks=(make_task(id="task-abc", interrupts=(interrupt,)),),
+            interrupts=(interrupt,),
+        )
+
+        mock_agent = AsyncMock()
+        mock_agent.aget_state.return_value = snapshot
+        mock_agent.with_config = Mock(return_value=mock_agent)
+
+        with patch("aegra_api.services.langgraph_service.get_langgraph_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.get_graph = create_get_graph_mock(return_value=mock_agent)
+
+            resp = client.get("/threads/test-123")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["thread_id"] == "test-123"
+        assert data["values"]["messages"][-1]["content"] == "hello"
+        assert data["interrupts"]["task-abc"][0]["id"] == "int-1"
+        assert data["config"]["configurable"]["checkpoint_id"] == "cp-1"
+        assert data["state_updated_at"].startswith("2024-06-01")
+        assert "next" not in data
+        assert "tasks" not in data
+        assert "checkpoint" not in data
+
+    def test_get_thread_with_graph_but_no_snapshot_returns_empty_state_fields(self) -> None:
+        """A missing checkpoint must not 404 the thread record."""
+        app = create_test_app(include_runs=False, include_threads=True)
+        thread = _thread_row("test-123", metadata={"graph_id": "test-graph"})
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> object:
+                return thread
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        mock_agent = AsyncMock()
+        mock_agent.aget_state.return_value = None
+        mock_agent.with_config = Mock(return_value=mock_agent)
+
+        with patch("aegra_api.services.langgraph_service.get_langgraph_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.get_graph = create_get_graph_mock(return_value=mock_agent)
+
+            resp = client.get("/threads/test-123")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["thread_id"] == "test-123"
+        assert data["values"] == {}
+        assert data["interrupts"] == {}
+        assert data["config"] == {}
+        assert data["state_updated_at"] is None
 
 
 class TestDeleteThread:
