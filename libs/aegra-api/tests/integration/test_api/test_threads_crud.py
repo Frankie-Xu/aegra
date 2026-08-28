@@ -401,7 +401,7 @@ class TestGetThread:
         app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
         client = make_client(app)
 
-        with patch("aegra_api.services.langgraph_service.get_langgraph_service") as mock_get_service:
+        with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
             resp = client.get("/threads/nonexistent")
 
         assert resp.status_code == 404
@@ -439,7 +439,7 @@ class TestGetThread:
         mock_agent.aget_state.return_value = snapshot
         mock_agent.with_config = Mock(return_value=mock_agent)
 
-        with patch("aegra_api.services.langgraph_service.get_langgraph_service") as mock_get_service:
+        with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
             mock_service = mock_get_service.return_value
             mock_service.get_graph = create_get_graph_mock(return_value=mock_agent)
 
@@ -472,7 +472,7 @@ class TestGetThread:
         mock_agent.aget_state.return_value = None
         mock_agent.with_config = Mock(return_value=mock_agent)
 
-        with patch("aegra_api.services.langgraph_service.get_langgraph_service") as mock_get_service:
+        with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
             mock_service = mock_get_service.return_value
             mock_service.get_graph = create_get_graph_mock(return_value=mock_agent)
 
@@ -485,6 +485,56 @@ class TestGetThread:
         assert data["interrupts"] == {}
         assert data["config"] == {}
         assert data["state_updated_at"] is None
+
+    def test_get_thread_returns_empty_state_fields_when_graph_not_found(self) -> None:
+        """Unresolvable graph_id must not 500 the thread record."""
+        app = create_test_app(include_runs=False, include_threads=True)
+        thread = _thread_row("test-123", metadata={"graph_id": "missing-graph"})
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> object:
+                return thread
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.get_graph = create_get_graph_mock(side_effect=ValueError("Graph not found: missing-graph"))
+
+            resp = client.get("/threads/test-123")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["thread_id"] == "test-123"
+        assert data["metadata"]["graph_id"] == "missing-graph"
+        assert data["values"] == {}
+        assert data["interrupts"] == {}
+        assert data["config"] == {}
+        assert data["state_updated_at"] is None
+
+    def test_get_thread_returns_500_without_internal_exception_details(self) -> None:
+        """Unexpected state-load errors must not leak exception text."""
+        app = create_test_app(include_runs=False, include_threads=True)
+        thread = _thread_row("test-123", metadata={"graph_id": "test-graph"})
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> object:
+                return thread
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.get_graph = create_get_graph_mock(side_effect=RuntimeError("secret boom"))
+
+            resp = client.get("/threads/test-123")
+
+        assert resp.status_code == 500
+        detail = resp.json()["detail"]
+        assert detail == "Failed to retrieve thread state"
+        assert "secret boom" not in str(resp.json())
 
 
 class TestDeleteThread:

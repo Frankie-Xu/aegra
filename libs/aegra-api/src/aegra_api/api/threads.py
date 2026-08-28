@@ -37,6 +37,10 @@ from aegra_api.models import (
     User,
 )
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, AgentProtocolError
+from aegra_api.services.langgraph_service import (
+    create_thread_config,
+    get_langgraph_service,
+)
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.services.thread_state_service import ThreadStateService
 from aegra_api.utils.run_utils import strip_pinned_config_keys
@@ -176,8 +180,7 @@ def _empty_thread_state_fields() -> dict[str, Any]:
 async def _load_thread_state_fields(thread: ThreadORM, user: User) -> dict[str, Any]:
     """Load Thread-contract fields from the latest checkpoint.
 
-    Uses the same get_graph → aget_state path as GET /threads/{id}/state, but
-    never 404s: a missing checkpoint is an empty projection, not a missing thread.
+    A missing checkpoint or unresolvable graph is an empty projection, not a 404.
     """
     empty = _empty_thread_state_fields()
     thread_metadata = getattr(thread, "metadata_json", None) or {}
@@ -188,11 +191,6 @@ async def _load_thread_state_fields(thread: ThreadORM, user: User) -> dict[str, 
         return empty
 
     thread_id = str(getattr(thread, "thread_id", ""))
-    from aegra_api.services.langgraph_service import (
-        create_thread_config,
-        get_langgraph_service,
-    )
-
     langgraph_service = get_langgraph_service()
     config: dict[str, Any] = create_thread_config(thread_id, user)
     try:
@@ -211,9 +209,16 @@ async def _load_thread_state_fields(thread: ThreadORM, user: User) -> dict[str, 
         if exc.status_code == 404:
             return empty
         raise
+    except ValueError:
+        logger.info(
+            "Graph '%s' could not be resolved for thread '%s'; returning empty state fields",
+            graph_id,
+            thread_id,
+        )
+        return empty
     except Exception as e:
         logger.exception("Failed to retrieve latest state for thread '%s'", thread_id)
-        raise HTTPException(500, f"Failed to retrieve thread state: {str(e)}") from e
+        raise HTTPException(500, "Failed to retrieve thread state") from e
 
 
 # --- Endpoints ---
