@@ -513,6 +513,81 @@ class TestGetThread:
         assert data["config"] == {}
         assert data["state_updated_at"] is None
 
+    def test_get_thread_returns_empty_state_fields_when_graph_id_is_list(self) -> None:
+        """Non-string graph_id must not reach get_graph (list is truthy)."""
+        app = create_test_app(include_runs=False, include_threads=True)
+        thread = _thread_row("test-123", metadata={"graph_id": ["agent"]})
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> object:
+                return thread
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
+            resp = client.get("/threads/test-123")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["thread_id"] == "test-123"
+        assert data["metadata"]["graph_id"] == ["agent"]
+        assert data["values"] == {}
+        assert data["interrupts"] == {}
+        assert data["config"] == {}
+        assert data["state_updated_at"] is None
+        mock_get_service.assert_not_called()
+
+    def test_get_thread_returns_empty_state_fields_when_graph_id_is_dict(self) -> None:
+        """Non-string graph_id must not reach get_graph (dict is truthy)."""
+        app = create_test_app(include_runs=False, include_threads=True)
+        thread = _thread_row("test-123", metadata={"graph_id": {"name": "agent"}})
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> object:
+                return thread
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
+            resp = client.get("/threads/test-123")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["thread_id"] == "test-123"
+        assert data["metadata"]["graph_id"] == {"name": "agent"}
+        assert data["values"] == {}
+        assert data["interrupts"] == {}
+        assert data["config"] == {}
+        assert data["state_updated_at"] is None
+        mock_get_service.assert_not_called()
+
+    def test_get_thread_returns_empty_state_fields_when_graph_id_is_empty_string(self) -> None:
+        """Empty-string graph_id is not a resolvable graph; skip get_graph."""
+        app = create_test_app(include_runs=False, include_threads=True)
+        thread = _thread_row("test-123", metadata={"graph_id": ""})
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> object:
+                return thread
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
+            resp = client.get("/threads/test-123")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["thread_id"] == "test-123"
+        assert data["metadata"]["graph_id"] == ""
+        assert data["values"] == {}
+        assert data["interrupts"] == {}
+        assert data["config"] == {}
+        assert data["state_updated_at"] is None
+        mock_get_service.assert_not_called()
+
     def test_get_thread_returns_500_without_internal_exception_details(self) -> None:
         """Unexpected state-load errors must not leak exception text."""
         app = create_test_app(include_runs=False, include_threads=True)

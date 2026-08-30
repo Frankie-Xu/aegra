@@ -187,7 +187,7 @@ async def _load_thread_state_fields(thread: ThreadORM, user: User) -> dict[str, 
     if not isinstance(thread_metadata, dict):
         return empty
     graph_id = thread_metadata.get("graph_id")
-    if not graph_id:
+    if not isinstance(graph_id, str) or not graph_id:
         return empty
 
     thread_id = str(getattr(thread, "thread_id", ""))
