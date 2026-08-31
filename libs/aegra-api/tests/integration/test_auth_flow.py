@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from importlib.machinery import ModuleSpec
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from fastapi import Depends, FastAPI, Request
@@ -297,7 +297,10 @@ class TestUserModelCustomFields:
         mock_request.scope = {}
         mock_request.user = None
 
-        with patch("aegra_api.core.auth_deps.get_auth_backend", return_value=backend):
+        with patch(
+            "aegra_api.core.auth_deps.get_auth_backend_async",
+            AsyncMock(return_value=backend),
+        ):
             # Set scope with authenticated user
             mock_request.scope["user"] = langgraph_user
             mock_request.scope["auth"] = credentials
@@ -337,7 +340,10 @@ class TestUserModelCustomFields:
         mock_request.scope = {}
         mock_request.user = None
 
-        with patch("aegra_api.core.auth_deps.get_auth_backend", return_value=backend):
+        with patch(
+            "aegra_api.core.auth_deps.get_auth_backend_async",
+            AsyncMock(return_value=backend),
+        ):
             user = await require_auth(mock_request)
 
             # Verify user is authenticated and custom fields are present

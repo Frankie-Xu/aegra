@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import threading
+from collections.abc import Callable
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -19,6 +22,7 @@ from aegra_api.core.auth_middleware import (
     LangGraphAuthBackend,
     LangGraphUser,
     get_auth_backend,
+    get_auth_backend_async,
     get_auth_instance,
     on_auth_error,
 )
@@ -77,6 +81,63 @@ def _count_spec_from_file_location(monkeypatch: pytest.MonkeyPatch) -> list[str]
         counting_spec,
     )
     return locations
+
+
+def _block_first_auth_file_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[str], threading.Event, threading.Event]:
+    """Hold the first auth-file spec creation until the test releases it."""
+    real_spec_from_file_location = auth_middleware_module.importlib.util.spec_from_file_location
+    locations: list[str] = []
+    load_started = threading.Event()
+    load_release = threading.Event()
+
+    def counting_spec(
+        name: str,
+        location: str | None = None,
+        *args: object,
+        **kwargs: object,
+    ) -> ModuleSpec | None:
+        if location is not None:
+            locations.append(location)
+        load_started.set()
+        if not load_release.wait(timeout=5):
+            raise TimeoutError("in-flight auth import was not released")
+        return real_spec_from_file_location(name, location, *args, **kwargs)
+
+    monkeypatch.setattr(
+        auth_middleware_module.importlib.util,
+        "spec_from_file_location",
+        counting_spec,
+    )
+    return locations, load_started, load_release
+
+
+def _run_concurrent_calls_during_in_flight_import(
+    *,
+    load_started: threading.Event,
+    load_release: threading.Event,
+    target: Callable[[], None],
+) -> None:
+    """Release both callers together, then keep the first import in-flight."""
+    ready = threading.Barrier(2)
+
+    def gated() -> None:
+        ready.wait()
+        target()
+
+    first = threading.Thread(target=gated)
+    second = threading.Thread(target=gated)
+    first.start()
+    second.start()
+    try:
+        assert load_started.wait(timeout=5)
+    finally:
+        load_release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+    assert not first.is_alive()
+    assert not second.is_alive()
 
 
 class TestLangGraphUser:
@@ -536,6 +597,88 @@ class TestAuthModuleLoadOnce:
         assert first.auth_instance is second.auth_instance
         assert first.auth_instance is via_factory.auth_instance
         assert get_auth_instance() is first.auth_instance
+        assert locations == [str(auth_file.resolve())]
+
+    def test_concurrent_first_misses_load_auth_module_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two threads racing an empty cache must import/construct Auth once."""
+        auth_file = _install_auth_config(tmp_path, monkeypatch)
+        locations, load_started, load_release = _block_first_auth_file_spec(monkeypatch)
+        backends: list[LangGraphAuthBackend] = []
+        errors: list[Exception] = []
+
+        def construct_backend() -> None:
+            try:
+                backends.append(LangGraphAuthBackend())
+            except Exception as exc:
+                errors.append(exc)
+
+        _run_concurrent_calls_during_in_flight_import(
+            load_started=load_started,
+            load_release=load_release,
+            target=construct_backend,
+        )
+
+        assert errors == []
+        assert len(backends) == 2
+        assert backends[0].auth_instance is not None
+        assert backends[0].auth_instance is backends[1].auth_instance
+        assert locations == [str(auth_file.resolve())]
+
+    def test_concurrent_get_auth_backend_constructs_once(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Two threads racing get_auth_backend() must share one backend and one import."""
+        auth_file = _install_auth_config(tmp_path, monkeypatch)
+        locations, load_started, load_release = _block_first_auth_file_spec(monkeypatch)
+        backends: list[object] = []
+        errors: list[Exception] = []
+
+        def call_factory() -> None:
+            try:
+                backends.append(get_auth_backend())
+            except Exception as exc:
+                errors.append(exc)
+
+        _run_concurrent_calls_during_in_flight_import(
+            load_started=load_started,
+            load_release=load_release,
+            target=call_factory,
+        )
+
+        assert errors == []
+        assert len(backends) == 2
+        assert backends[0] is backends[1]
+        assert isinstance(backends[0], LangGraphAuthBackend)
+        assert backends[0].auth_instance is not None
+        assert locations == [str(auth_file.resolve())]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_async_first_misses_load_auth_module_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two async tasks racing an empty cache must import/construct Auth once."""
+        auth_file = _install_auth_config(tmp_path, monkeypatch)
+        locations = _count_spec_from_file_location(monkeypatch)
+        barrier = asyncio.Barrier(2)
+        in_flight = 0
+        max_in_flight = 0
+
+        async def load_backend() -> object:
+            nonlocal in_flight, max_in_flight
+            await barrier.wait()
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            try:
+                return await get_auth_backend_async()
+            finally:
+                in_flight -= 1
+
+        first, second = await asyncio.gather(load_backend(), load_backend())
+
+        assert max_in_flight == 2
+        assert first is second
+        assert isinstance(first, LangGraphAuthBackend)
+        assert first.auth_instance is not None
         assert locations == [str(auth_file.resolve())]
 
     def test_missing_auth_file_is_not_reprobed_per_init(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from httpx import HTTPStatusError
 
+from aegra_api.core.auth_middleware import _clear_auth_loader_caches
 from tests.fixtures.auth import DummyUser
 from tests.fixtures.clients import (
     create_test_app,
@@ -129,8 +130,6 @@ def clear_auth_cache() -> Iterator[None]:
     Auth loaders and get_auth_backend() are process-cached; tests that swap
     aegra.json paths need a clean cache so they do not see a sibling's Auth.
     """
-    from aegra_api.core.auth_middleware import _clear_auth_loader_caches
-
     _clear_auth_loader_caches()
     yield
     _clear_auth_loader_caches()

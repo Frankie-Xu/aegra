@@ -5,12 +5,14 @@ This module integrates authentication system with FastAPI
 using Starlette's AuthenticationMiddleware.
 """
 
+import asyncio
 import functools
 import importlib
 import importlib.util
 import sys
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import structlog
 from langgraph_sdk import Auth
@@ -29,6 +31,34 @@ from aegra_api.models.errors import AgentProtocolError
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
+
+# Thread callers (lru_cache concurrent misses). Never acquired on a running loop.
+_auth_thread_lock = threading.RLock()
+_auth_async_lock: asyncio.Lock | None = None
+
+
+class _LruCachedFn[T](Protocol):
+    def __call__(self) -> T: ...
+    def cache_info(self) -> Any: ...
+
+
+def _get_auth_async_lock() -> asyncio.Lock:
+    global _auth_async_lock
+    if _auth_async_lock is None:
+        _auth_async_lock = asyncio.Lock()
+    return _auth_async_lock
+
+
+def _lru_fill_once[T](cached_fn: _LruCachedFn[T]) -> T:
+    """Single-flight an lru_cache fill without blocking a running event loop."""
+    if cached_fn.cache_info().currsize:
+        return cached_fn()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        with _auth_thread_lock:
+            return cached_fn()
+    return cached_fn()
 
 
 class LangGraphUser(BaseUser):
@@ -169,7 +199,7 @@ def _load_auth_from_path(path: str) -> Auth | None:
 
 
 @functools.lru_cache(maxsize=1)
-def _cached_load_auth_from_config() -> Auth | None:
+def _load_auth_from_config_cached() -> Auth | None:
     """Read auth.path from config and load. Cached for the process lifetime."""
     try:
         auth_config = load_auth_config()
@@ -185,6 +215,11 @@ def _cached_load_auth_from_config() -> Auth | None:
 
     logger.debug("No auth instance found from config")
     return None
+
+
+def _cached_load_auth_from_config() -> Auth | None:
+    """Load Auth from aegra.json; concurrent first-misses share one read."""
+    return _lru_fill_once(_load_auth_from_config_cached)
 
 
 class LangGraphAuthBackend(AuthenticationBackend):
@@ -290,15 +325,7 @@ class LangGraphAuthBackend(AuthenticationBackend):
 
 
 @functools.lru_cache(maxsize=1)
-def get_auth_backend() -> AuthenticationBackend:
-    """
-    Get authentication backend based on AUTH_TYPE environment variable.
-
-    Cached so the auth module is loaded once at first use, not per-request.
-
-    Returns:
-        AuthenticationBackend instance
-    """
+def _get_auth_backend_cached() -> AuthenticationBackend:
     auth_type = settings.app.AUTH_TYPE
 
     if auth_type in ["noop", "custom"]:
@@ -309,11 +336,37 @@ def get_auth_backend() -> AuthenticationBackend:
         return LangGraphAuthBackend()
 
 
+def get_auth_backend() -> AuthenticationBackend:
+    """
+    Get authentication backend based on AUTH_TYPE environment variable.
+
+    Cached so the auth module is loaded once at first use, not per-request.
+
+    Returns:
+        AuthenticationBackend instance
+    """
+    return _lru_fill_once(_get_auth_backend_cached)
+
+
+async def get_auth_backend_async() -> AuthenticationBackend:
+    """Async single-flight wrapper for request-path backend construction."""
+    if _get_auth_backend_cached.cache_info().currsize:
+        return _get_auth_backend_cached()
+    async with _get_auth_async_lock():
+        if _get_auth_backend_cached.cache_info().currsize:
+            return _get_auth_backend_cached()
+        # Let a racing task wait on the lock before this fill runs.
+        await asyncio.sleep(0)
+        return _get_auth_backend_cached()
+
+
 def _clear_auth_loader_caches() -> None:
     """Drop process-level auth loader caches. Tests call this for isolation."""
-    _cached_load_auth_from_config.cache_clear()
+    global _auth_async_lock
+    _load_auth_from_config_cached.cache_clear()
     _load_auth_from_path.cache_clear()
-    get_auth_backend.cache_clear()
+    _get_auth_backend_cached.cache_clear()
+    _auth_async_lock = None
 
 
 def on_auth_error(conn: HTTPConnection, exc: AuthenticationError) -> JSONResponse:
