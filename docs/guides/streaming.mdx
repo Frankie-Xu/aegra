@@ -252,7 +252,7 @@ Aegra stores streaming events in a replay buffer (Redis Lists when `REDIS_BROKER
 
 1. Track the last event ID you received
 2. Reconnect to `GET /threads/{thread_id}/runs/{run_id}/stream` with `Last-Event-ID` header
-3. You'll receive all events from where you left off, then an `end` event if the run has finished
+3. You'll receive any available buffered events from where you left off, then an `end` event if the run has finished. After cleanup or restart, replay may be gone and the stream emits only the synthesized `end`.
 
 Events are retained for 1 hour after the run completes.
 
