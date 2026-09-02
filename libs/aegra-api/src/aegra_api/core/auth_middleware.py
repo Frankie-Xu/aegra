@@ -11,6 +11,7 @@ import importlib
 import importlib.util
 import sys
 import threading
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -34,19 +35,14 @@ logger = structlog.getLogger(__name__)
 
 # Thread callers (lru_cache concurrent misses). Never acquired on a running loop.
 _auth_thread_lock = threading.RLock()
-_auth_async_lock: asyncio.Lock | None = None
+# Shared in-flight backend fill. Sync waiters use Future.result(); async waiters wrap it.
+_auth_fill_guard = threading.Lock()
+_auth_backend_fill: Future[AuthenticationBackend] | None = None
 
 
 class _LruCachedFn[T](Protocol):
     def __call__(self) -> T: ...
     def cache_info(self) -> Any: ...
-
-
-def _get_auth_async_lock() -> asyncio.Lock:
-    global _auth_async_lock
-    if _auth_async_lock is None:
-        _auth_async_lock = asyncio.Lock()
-    return _auth_async_lock
 
 
 def _lru_fill_once[T](cached_fn: _LruCachedFn[T]) -> T:
@@ -324,6 +320,42 @@ class LangGraphAuthBackend(AuthenticationBackend):
             raise AuthenticationError("Authentication system error") from e
 
 
+def _claim_auth_backend_fill() -> tuple[Future[AuthenticationBackend], bool]:
+    """Return the in-flight fill future and whether the caller must populate it."""
+    global _auth_backend_fill
+    with _auth_fill_guard:
+        if _get_auth_backend_cached.cache_info().currsize:
+            done: Future[AuthenticationBackend] = Future()
+            done.set_result(_get_auth_backend_cached())
+            return done, False
+        if _auth_backend_fill is None or _auth_backend_fill.done():
+            _auth_backend_fill = Future()
+            return _auth_backend_fill, True
+        return _auth_backend_fill, False
+
+
+def _fail_auth_backend_fill(fut: Future[AuthenticationBackend], exc: BaseException) -> None:
+    """Publish a joinable error; never attach CancelledError to waiters."""
+    if fut.done():
+        return
+    if isinstance(exc, Exception):
+        fut.set_exception(exc)
+        return
+    fut.set_exception(RuntimeError("auth backend initialization failed"))
+
+
+def _complete_auth_backend_fill(fut: Future[AuthenticationBackend]) -> AuthenticationBackend:
+    """Run the cached constructor and publish the result to joiners."""
+    try:
+        result = _get_auth_backend_cached()
+    except BaseException as exc:
+        _fail_auth_backend_fill(fut, exc)
+        raise
+    if not fut.done():
+        fut.set_result(result)
+    return result
+
+
 @functools.lru_cache(maxsize=1)
 def _get_auth_backend_cached() -> AuthenticationBackend:
     auth_type = settings.app.AUTH_TYPE
@@ -345,28 +377,38 @@ def get_auth_backend() -> AuthenticationBackend:
     Returns:
         AuthenticationBackend instance
     """
-    return _lru_fill_once(_get_auth_backend_cached)
+    if _get_auth_backend_cached.cache_info().currsize:
+        return _get_auth_backend_cached()
+    fut, owner = _claim_auth_backend_fill()
+    if not owner:
+        return fut.result()
+    return _complete_auth_backend_fill(fut)
 
 
 async def get_auth_backend_async() -> AuthenticationBackend:
-    """Async single-flight wrapper for request-path backend construction."""
+    """Join get_auth_backend()'s in-flight Future; owner fills on this loop, not in to_thread."""
     if _get_auth_backend_cached.cache_info().currsize:
         return _get_auth_backend_cached()
-    async with _get_auth_async_lock():
-        if _get_auth_backend_cached.cache_info().currsize:
-            return _get_auth_backend_cached()
-        # Let a racing task wait on the lock before this fill runs.
+    fut, owner = _claim_auth_backend_fill()
+    if not owner:
+        return await asyncio.wrap_future(fut)
+    try:
+        # Let a racing task await the future before this fill runs.
         await asyncio.sleep(0)
-        return _get_auth_backend_cached()
+        return _complete_auth_backend_fill(fut)
+    except BaseException as exc:
+        _fail_auth_backend_fill(fut, exc)
+        raise
 
 
 def _clear_auth_loader_caches() -> None:
     """Drop process-level auth loader caches. Tests call this for isolation."""
-    global _auth_async_lock
-    _load_auth_from_config_cached.cache_clear()
-    _load_auth_from_path.cache_clear()
-    _get_auth_backend_cached.cache_clear()
-    _auth_async_lock = None
+    global _auth_backend_fill
+    with _auth_fill_guard:
+        _load_auth_from_config_cached.cache_clear()
+        _load_auth_from_path.cache_clear()
+        _get_auth_backend_cached.cache_clear()
+        _auth_backend_fill = None
 
 
 def on_auth_error(conn: HTTPConnection, exc: AuthenticationError) -> JSONResponse:

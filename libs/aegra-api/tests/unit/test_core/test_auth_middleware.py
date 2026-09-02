@@ -7,12 +7,13 @@ import json
 import os
 import threading
 from collections.abc import Callable
+from concurrent.futures import Future
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from starlette.authentication import AuthCredentials, AuthenticationError
+from starlette.authentication import AuthCredentials, AuthenticationBackend, AuthenticationError
 from starlette.requests import HTTPConnection
 from starlette.responses import JSONResponse
 
@@ -111,6 +112,30 @@ def _block_first_auth_file_spec(
         counting_spec,
     )
     return locations, load_started, load_release
+
+
+def _notify_when_auth_backend_claimed(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    waiters: int,
+) -> threading.Event:
+    """Set an event after `waiters` callers have claimed the shared fill Future."""
+    claimed = threading.Event()
+    guard = threading.Lock()
+    count = 0
+    real_claim = auth_middleware_module._claim_auth_backend_fill
+
+    def counting_claim() -> tuple[Future[AuthenticationBackend], bool]:
+        nonlocal count
+        result = real_claim()
+        with guard:
+            count += 1
+            if count >= waiters:
+                claimed.set()
+        return result
+
+    monkeypatch.setattr(auth_middleware_module, "_claim_auth_backend_fill", counting_claim)
+    return claimed
 
 
 def _run_concurrent_calls_during_in_flight_import(
@@ -680,6 +705,103 @@ class TestAuthModuleLoadOnce:
         assert isinstance(first, LangGraphAuthBackend)
         assert first.auth_instance is not None
         assert locations == [str(auth_file.resolve())]
+
+    @pytest.mark.asyncio
+    async def test_sync_thread_and_async_first_miss_load_auth_module_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A thread get_auth_backend() racing get_auth_backend_async() must import once."""
+        auth_file = _install_auth_config(tmp_path, monkeypatch)
+        locations, load_started, load_release = _block_first_auth_file_spec(monkeypatch)
+        both_claimed = _notify_when_auth_backend_claimed(monkeypatch, waiters=2)
+        sync_backends: list[object] = []
+        errors: list[BaseException] = []
+        sync_ready = threading.Event()
+        start_fill = threading.Event()
+
+        def call_sync() -> None:
+            sync_ready.set()
+            if not start_fill.wait(timeout=5):
+                errors.append(TimeoutError("sync caller was not released into the empty-cache fill"))
+                return
+            try:
+                sync_backends.append(get_auth_backend())
+            except Exception as exc:
+                errors.append(exc)
+
+        sync_thread = threading.Thread(target=call_sync)
+        sync_thread.start()
+        try:
+            assert await asyncio.to_thread(sync_ready.wait, 5)
+
+            async def call_async() -> object:
+                if not await asyncio.to_thread(start_fill.wait, 5):
+                    raise TimeoutError("async caller was not released into the empty-cache fill")
+                return await get_auth_backend_async()
+
+            async_task = asyncio.create_task(call_async())
+            start_fill.set()
+            assert await asyncio.to_thread(load_started.wait, 5)
+            assert await asyncio.to_thread(both_claimed.wait, 5)
+            load_release.set()
+            async_backend = await asyncio.wait_for(async_task, timeout=5)
+        finally:
+            load_release.set()
+            sync_thread.join(timeout=5)
+
+        assert errors == []
+        assert not sync_thread.is_alive()
+        assert len(sync_backends) == 1
+        assert sync_backends[0] is async_backend
+        assert isinstance(async_backend, LangGraphAuthBackend)
+        assert async_backend.auth_instance is not None
+        assert locations == [str(auth_file.resolve())]
+
+    @pytest.mark.asyncio
+    async def test_sync_and_async_joiners_see_same_fill_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A failed fill must set_exception so sync and async callers see the same error."""
+        both_claimed = _notify_when_auth_backend_claimed(monkeypatch, waiters=2)
+        sync_errors: list[BaseException] = []
+        sync_ready = threading.Event()
+        start_fill = threading.Event()
+
+        def exploding_init(self: LangGraphAuthBackend) -> None:
+            if not both_claimed.wait(timeout=5):
+                raise TimeoutError("second caller did not join before fill failed")
+            raise RuntimeError("backend fill failed")
+
+        monkeypatch.setattr(LangGraphAuthBackend, "__init__", exploding_init)
+
+        def call_sync() -> None:
+            sync_ready.set()
+            if not start_fill.wait(timeout=5):
+                sync_errors.append(TimeoutError("sync caller was not released into the empty-cache fill"))
+                return
+            try:
+                get_auth_backend()
+            except Exception as exc:
+                sync_errors.append(exc)
+
+        sync_thread = threading.Thread(target=call_sync)
+        sync_thread.start()
+        try:
+            assert await asyncio.to_thread(sync_ready.wait, 5)
+
+            async def call_async() -> None:
+                if not await asyncio.to_thread(start_fill.wait, 5):
+                    raise TimeoutError("async caller was not released into the empty-cache fill")
+                await get_auth_backend_async()
+
+            async_task = asyncio.create_task(call_async())
+            start_fill.set()
+            with pytest.raises(RuntimeError, match="backend fill failed") as async_raised:
+                await asyncio.wait_for(async_task, timeout=5)
+        finally:
+            sync_thread.join(timeout=5)
+
+        assert not sync_thread.is_alive()
+        assert len(sync_errors) == 1
+        assert sync_errors[0] is async_raised.value
 
     def test_missing_auth_file_is_not_reprobed_per_init(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """A missing auth file is resolved once; later inits reuse that result."""
