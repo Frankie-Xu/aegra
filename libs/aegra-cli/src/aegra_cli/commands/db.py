@@ -109,17 +109,11 @@ def upgrade() -> None:
         )
     )
 
-    from aegra_api.core.migrations import get_alembic_config
-    from alembic import command
-
-    cfg = get_alembic_config()
-
-    def run() -> None:
-        command.upgrade(cfg, "head")
+    from aegra_api.core.migrations import run_migrations
 
     _run_alembic(
         "upgrade",
-        run,
+        run_migrations,
         success_msg="Database upgraded successfully!",
         error_prefix="Alembic upgrade",
     )

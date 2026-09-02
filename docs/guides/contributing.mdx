@@ -146,17 +146,17 @@ Aegra uses Alembic for database migrations. Migrations apply automatically on se
 # Create a new migration
 uv run --package aegra-api alembic revision --autogenerate -m "Add user preferences"
 
-# Apply migrations manually
-uv run --package aegra-api alembic upgrade head
+# Apply pending migrations (operator path; session lock is in alembic/env.py)
+aegra db upgrade
 
 # Rollback last migration
-uv run --package aegra-api alembic downgrade -1
+aegra db downgrade -1
 
 # Show migration history
-uv run --package aegra-api alembic history
+aegra db history -v
 
 # Show current version
-uv run --package aegra-api alembic current
+aegra db current
 ```
 
 ### Making database changes
@@ -169,7 +169,7 @@ uv run --package aegra-api alembic current
 ### Testing migrations
 
 ```bash
-# Test full upgrade/downgrade cycle
+# Test full upgrade/downgrade cycle (single process; online env.py still serializes)
 uv run --package aegra-api alembic downgrade base
 uv run --package aegra-api alembic upgrade head
 ```
