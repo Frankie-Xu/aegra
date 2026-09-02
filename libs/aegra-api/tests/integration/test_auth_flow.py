@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from langgraph_sdk import Auth
 from starlette.authentication import AuthCredentials
@@ -20,6 +20,7 @@ from starlette.requests import HTTPConnection
 
 from aegra_api.core.auth_deps import require_auth
 from aegra_api.core.auth_middleware import LangGraphAuthBackend, LangGraphUser
+from aegra_api.main import agent_protocol_exception_handler
 from aegra_api.models.auth import User
 
 
@@ -383,13 +384,15 @@ def _auth_succeeding() -> Auth:
 
 
 class TestAuthenticateHttpStatusPassthrough:
-    """HTTP-level: handler status codes must reach the response, not collapse to 401."""
+    """HTTP-level: handler status/headers reach the Agent Protocol response, not collapse to 401."""
 
     def _get(self, auth_instance: Auth | None) -> tuple[int, dict[str, object], dict[str, str]]:
         backend = LangGraphAuthBackend()
         backend.auth_instance = auth_instance
 
         app = FastAPI()
+        # Exercise production JSON + header forwarding, not FastAPI's default handler.
+        app.add_exception_handler(HTTPException, agent_protocol_exception_handler)
 
         @app.get("/protected")
         async def protected(user: User = Depends(require_auth)) -> dict[str, str]:
@@ -414,16 +417,18 @@ class TestAuthenticateHttpStatusPassthrough:
         code, body, _headers = self._get(_auth_raising(status_code=status_code, detail=detail))
 
         assert code == status_code
-        assert body["detail"] == detail
+        assert body["message"] == detail
 
     def test_handler_http_exception_headers_reach_client(self) -> None:
-        _code, _body, headers = self._get(
+        code, body, headers = self._get(
             _auth_raising(
                 status_code=401,
                 detail="invalid token",
                 headers={"WWW-Authenticate": "Bearer"},
             )
         )
+        assert code == 401
+        assert body["message"] == "invalid token"
         assert headers.get("www-authenticate") == "Bearer"
 
     def test_non_http_exception_stays_401_without_leaking(self) -> None:
@@ -437,7 +442,7 @@ class TestAuthenticateHttpStatusPassthrough:
 
         assert code == 401
         assert "secret" not in str(body)
-        assert "Authentication system error" in str(body["detail"])
+        assert "Authentication system error" in str(body["message"])
 
     def test_successful_auth_unchanged(self) -> None:
         code, body, _headers = self._get(_auth_succeeding())
