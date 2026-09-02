@@ -13,6 +13,7 @@ from sqlalchemy.dialects import postgresql
 
 from aegra_api.api import threads as threads_module
 from aegra_api.core.orm import get_session as core_get_session
+from aegra_api.settings import settings
 from tests.fixtures.clients import create_test_app, make_client
 from tests.fixtures.database import (
     DummyScalarResult,
@@ -637,6 +638,47 @@ class TestSearchThreads:
         resp = client.post("/threads/search", json={"metadata": {"active": True}})
         assert resp.status_code == 200
         assert isinstance(resp.json(), list)
+
+    def test_search_accepts_limit_500(self, client: TestClient) -> None:
+        """LangGraph SDK clients page with limit=500; must not 422."""
+        resp = client.post("/threads/search", json={"limit": 500})
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_search_accepts_limit_at_cap(self, client: TestClient) -> None:
+        resp = client.post("/threads/search", json={"limit": settings.app.MAX_SEARCH_LIMIT})
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_search_accepts_null_limit(self, client: TestClient) -> None:
+        resp = client.post("/threads/search", json={"limit": None})
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_search_returns_422_when_limit_exceeds_cap(self, client: TestClient) -> None:
+        """limit above MAX_SEARCH_LIMIT is rejected at the request model."""
+        cap = settings.app.MAX_SEARCH_LIMIT
+        resp = client.post("/threads/search", json={"limit": cap + 1})
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert any(
+            error.get("loc") == ["body", "limit"]
+            and error.get("type") == "less_than_equal"
+            and error.get("ctx", {}).get("le") == cap
+            for error in detail
+        )
+
+    @pytest.mark.parametrize("limit", [0, -1])
+    def test_search_returns_422_when_limit_is_zero_or_negative(self, client: TestClient, limit: int) -> None:
+        resp = client.post("/threads/search", json={"limit": limit})
+        assert resp.status_code == 422
+        assert "limit" in resp.text
+
+    @pytest.mark.parametrize("limit", ["abc", [], {}, 20.5])
+    def test_search_returns_422_when_limit_is_not_an_integer(self, client: TestClient, limit: object) -> None:
+        resp = client.post("/threads/search", json={"limit": limit})
+        assert resp.status_code == 422
+        assert "limit" in resp.text
 
 
 class TestThreadGetState:

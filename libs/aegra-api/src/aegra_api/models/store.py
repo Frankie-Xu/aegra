@@ -4,6 +4,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from aegra_api.models.search_limit import (
+    DEFAULT_SEARCH_LIMIT,
+    enforce_search_limit,
+    search_limit_json_schema_extra,
+)
+
 
 class StorePutRequest(BaseModel):
     """Request model for storing items"""
@@ -39,8 +45,18 @@ class StoreSearchRequest(BaseModel):
     namespace_prefix: list[str] = Field(..., description="Namespace prefix to search")
     filter: dict[str, Any] | None = Field(None, description="Optional dictionary of key-value pairs to filter results.")
     query: str | None = Field(None, description="Search query")
-    limit: int | None = Field(20, le=100, ge=1, description="Maximum results")
+    limit: int | None = Field(
+        DEFAULT_SEARCH_LIMIT,
+        ge=1,
+        description="Maximum results",
+        json_schema_extra=search_limit_json_schema_extra,
+    )
     offset: int | None = Field(0, ge=0, description="Results offset")
+
+    @field_validator("limit")
+    @classmethod
+    def validate_limit(cls, v: int | None) -> int | None:
+        return enforce_search_limit(v)
 
 
 class StoreItem(BaseModel):
