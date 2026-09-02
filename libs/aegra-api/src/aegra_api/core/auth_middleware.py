@@ -391,7 +391,8 @@ async def get_auth_backend_async() -> AuthenticationBackend:
         return _get_auth_backend_cached()
     fut, owner = _claim_auth_backend_fill()
     if not owner:
-        return await asyncio.wrap_future(fut)
+        # shield: a cancelled joiner must not cancel the shared fill Future.
+        return await asyncio.shield(asyncio.wrap_future(fut))
     try:
         # Let a racing task await the future before this fill runs.
         await asyncio.sleep(0)

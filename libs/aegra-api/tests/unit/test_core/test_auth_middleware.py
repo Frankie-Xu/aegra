@@ -138,6 +138,35 @@ def _notify_when_auth_backend_claimed(
     return claimed
 
 
+def _notify_when_async_fill_wrapped(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    waiters: int,
+) -> threading.Event:
+    """Set an event after `waiters` async joiners wrap the shared fill Future."""
+    wrapped = threading.Event()
+    guard = threading.Lock()
+    count = 0
+    real_wrap_future = asyncio.wrap_future
+
+    def counting_wrap_future(
+        future: Future[AuthenticationBackend],
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> asyncio.Future[AuthenticationBackend]:
+        nonlocal count
+        result = real_wrap_future(future, loop=loop)
+        if future is auth_middleware_module._auth_backend_fill:
+            with guard:
+                count += 1
+                if count >= waiters:
+                    wrapped.set()
+        return result
+
+    monkeypatch.setattr(asyncio, "wrap_future", counting_wrap_future)
+    return wrapped
+
+
 def _run_concurrent_calls_during_in_flight_import(
     *,
     load_started: threading.Event,
@@ -755,6 +784,56 @@ class TestAuthModuleLoadOnce:
         assert sync_backends[0] is async_backend
         assert isinstance(async_backend, LangGraphAuthBackend)
         assert async_backend.auth_instance is not None
+        assert locations == [str(auth_file.resolve())]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_async_joiner_does_not_cancel_shared_fill(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cancelling one async joiner must not cancel the shared fill or other waiters."""
+        auth_file = _install_auth_config(tmp_path, monkeypatch)
+        locations, load_started, load_release = _block_first_auth_file_spec(monkeypatch)
+        all_claimed = _notify_when_auth_backend_claimed(monkeypatch, waiters=3)
+        joiners_wrapped = _notify_when_async_fill_wrapped(monkeypatch, waiters=2)
+        sync_backends: list[object] = []
+        errors: list[BaseException] = []
+
+        def call_sync() -> None:
+            try:
+                sync_backends.append(get_auth_backend())
+            except Exception as exc:
+                errors.append(exc)
+
+        sync_thread = threading.Thread(target=call_sync)
+        sync_thread.start()
+        try:
+            assert await asyncio.to_thread(load_started.wait, 5)
+
+            cancelled_joiner = asyncio.create_task(get_auth_backend_async())
+            surviving_joiner = asyncio.create_task(get_auth_backend_async())
+            assert await asyncio.to_thread(all_claimed.wait, 5)
+            assert await asyncio.to_thread(joiners_wrapped.wait, 5)
+
+            shared_fill = auth_middleware_module._auth_backend_fill
+            assert shared_fill is not None
+            cancelled_joiner.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled_joiner
+            assert not shared_fill.cancelled()
+            assert not shared_fill.done()
+
+            load_release.set()
+            surviving_backend = await asyncio.wait_for(surviving_joiner, timeout=5)
+        finally:
+            load_release.set()
+            sync_thread.join(timeout=5)
+
+        assert errors == []
+        assert not sync_thread.is_alive()
+        assert len(sync_backends) == 1
+        assert sync_backends[0] is surviving_backend
+        assert isinstance(surviving_backend, LangGraphAuthBackend)
+        assert surviving_backend.auth_instance is not None
         assert locations == [str(auth_file.resolve())]
 
     @pytest.mark.asyncio
