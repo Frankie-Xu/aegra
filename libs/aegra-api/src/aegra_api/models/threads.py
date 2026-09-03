@@ -6,8 +6,7 @@ from typing import Any, Literal
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from aegra_api.models.search_limit import (
-    DEFAULT_SEARCH_LIMIT,
-    enforce_search_limit,
+    resolve_search_limit,
     search_limit_json_schema_extra,
 )
 from aegra_api.utils.status_compat import validate_thread_status
@@ -112,9 +111,11 @@ class ThreadSearchRequest(BaseModel):
 
     metadata: dict[str, Any] | None = Field(None, description="Metadata filters")
     status: str | None = Field(None, description="Thread status filter (idle, busy, interrupted, error)")
+    # None default + validate_default so omitted and JSON null share one resolver.
     limit: int | None = Field(
-        DEFAULT_SEARCH_LIMIT,
+        default=None,
         ge=1,
+        validate_default=True,
         description="Maximum results",
         json_schema_extra=search_limit_json_schema_extra,
     )
@@ -135,8 +136,8 @@ class ThreadSearchRequest(BaseModel):
 
     @field_validator("limit")
     @classmethod
-    def validate_limit(cls, v: int | None) -> int | None:
-        return enforce_search_limit(v)
+    def validate_limit(cls: type["ThreadSearchRequest"], v: int | None) -> int:
+        return resolve_search_limit(v)
 
     @field_validator("status")
     @classmethod

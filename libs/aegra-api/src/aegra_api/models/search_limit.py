@@ -12,10 +12,14 @@ from aegra_api.settings import settings
 DEFAULT_SEARCH_LIMIT: int = 20
 
 
-def enforce_search_limit(value: int | None) -> int | None:
-    """Reject page sizes above the configured server cap."""
+def effective_search_limit() -> int:
+    return min(DEFAULT_SEARCH_LIMIT, settings.app.MAX_SEARCH_LIMIT)
+
+
+def resolve_search_limit(value: int | None) -> int:
+    # Omitted fields and JSON null both arrive as None.
     if value is None:
-        return value
+        return effective_search_limit()
     cap = settings.app.MAX_SEARCH_LIMIT
     if value > cap:
         # Same type/msg/ctx as Field(le=cap) so 422 payloads stay Pydantic-shaped.
@@ -24,8 +28,8 @@ def enforce_search_limit(value: int | None) -> int | None:
 
 
 def search_limit_json_schema_extra(schema: dict[str, Any]) -> None:
-    """Advertise the live cap on the integer branch of the OpenAPI schema."""
     cap = settings.app.MAX_SEARCH_LIMIT
+    schema["default"] = effective_search_limit()
     for option in schema.get("anyOf", []):
         if isinstance(option, dict) and option.get("type") == "integer":
             option["maximum"] = cap

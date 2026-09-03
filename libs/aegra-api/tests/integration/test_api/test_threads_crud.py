@@ -20,7 +20,7 @@ from tests.fixtures.database import (
     DummySessionBase,
     override_get_session_dep,
 )
-from tests.fixtures.session_fixtures import BasicSession, override_session_dependency
+from tests.fixtures.session_fixtures import BasicSession, ThreadSession, override_session_dependency
 from tests.fixtures.test_helpers import DummyRun, DummyThread
 
 
@@ -654,6 +654,42 @@ class TestSearchThreads:
         resp = client.post("/threads/search", json={"limit": None})
         assert resp.status_code == 200
         assert isinstance(resp.json(), list)
+
+    def test_search_omitted_limit_honors_cap_below_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings.app, "MAX_SEARCH_LIMIT", 10)
+        captured: list[int | None] = []
+        app = create_test_app(include_runs=False, include_threads=True)
+        threads = [_thread_row("thread-1")]
+
+        class Session(ThreadSession):
+            async def scalars(self, stmt: Any = None) -> Any:
+                if stmt is not None and hasattr(stmt, "_limit"):
+                    captured.append(stmt._limit)
+                return await super().scalars(stmt)
+
+        override_session_dependency(app, Session, threads=threads)
+        client = make_client(app)
+        resp = client.post("/threads/search", json={})
+        assert resp.status_code == 200
+        assert captured == [10]
+
+    def test_search_null_limit_honors_cap_below_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings.app, "MAX_SEARCH_LIMIT", 10)
+        captured: list[int | None] = []
+        app = create_test_app(include_runs=False, include_threads=True)
+        threads = [_thread_row("thread-1")]
+
+        class Session(ThreadSession):
+            async def scalars(self, stmt: Any = None) -> Any:
+                if stmt is not None and hasattr(stmt, "_limit"):
+                    captured.append(stmt._limit)
+                return await super().scalars(stmt)
+
+        override_session_dependency(app, Session, threads=threads)
+        client = make_client(app)
+        resp = client.post("/threads/search", json={"limit": None})
+        assert resp.status_code == 200
+        assert captured == [10]
 
     def test_search_returns_422_when_limit_exceeds_cap(self, client: TestClient) -> None:
         """limit above MAX_SEARCH_LIMIT is rejected at the request model."""

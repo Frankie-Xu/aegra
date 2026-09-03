@@ -479,6 +479,38 @@ class TestSearchStoreItems:
         mock_store.asearch.assert_called_once()
         assert mock_store.asearch.call_args.kwargs["limit"] == 20
 
+    def test_search_items_omitted_limit_honors_cap_below_default(
+        self, client: TestClient, mock_store: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings.app, "MAX_SEARCH_LIMIT", 10)
+        mock_store.asearch.return_value = []
+
+        resp = client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["test"], "query": None},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["limit"] == 10
+        mock_store.asearch.assert_called_once()
+        assert mock_store.asearch.call_args.kwargs["limit"] == 10
+
+    def test_search_items_null_limit_honors_cap_below_default(
+        self, client: TestClient, mock_store: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings.app, "MAX_SEARCH_LIMIT", 10)
+        mock_store.asearch.return_value = []
+
+        resp = client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["test"], "limit": None},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["limit"] == 10
+        mock_store.asearch.assert_called_once()
+        assert mock_store.asearch.call_args.kwargs["limit"] == 10
+
     def test_search_items_returns_422_when_limit_exceeds_cap(self, client: TestClient, mock_store: AsyncMock) -> None:
         """limit above MAX_SEARCH_LIMIT is rejected before the store query."""
         cap = settings.app.MAX_SEARCH_LIMIT
