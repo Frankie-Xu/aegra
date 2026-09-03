@@ -35,7 +35,7 @@ logger = structlog.getLogger(__name__)
 
 # Thread callers (lru_cache concurrent misses). Never acquired on a running loop.
 _auth_thread_lock = threading.RLock()
-# Shared in-flight backend fill. Sync waiters use Future.result(); async waiters wrap it.
+# Shared in-flight backend fill. Callers join through get_auth_backend().
 _auth_fill_guard = threading.Lock()
 _auth_backend_fill: Future[AuthenticationBackend] | None = None
 
@@ -386,20 +386,11 @@ def get_auth_backend() -> AuthenticationBackend:
 
 
 async def get_auth_backend_async() -> AuthenticationBackend:
-    """Join get_auth_backend()'s in-flight Future; owner fills on this loop, not in to_thread."""
+    """Join get_auth_backend() off-loop so a sync waiter cannot deadlock this loop."""
     if _get_auth_backend_cached.cache_info().currsize:
         return _get_auth_backend_cached()
-    fut, owner = _claim_auth_backend_fill()
-    if not owner:
-        # shield: a cancelled joiner must not cancel the shared fill Future.
-        return await asyncio.shield(asyncio.wrap_future(fut))
-    try:
-        # Let a racing task await the future before this fill runs.
-        await asyncio.sleep(0)
-        return _complete_auth_backend_fill(fut)
-    except BaseException as exc:
-        _fail_auth_backend_fill(fut, exc)
-        raise
+    # shield: cancelling one waiter must not cancel the worker running the shared fill.
+    return await asyncio.shield(asyncio.to_thread(get_auth_backend))
 
 
 def _clear_auth_loader_caches() -> None:

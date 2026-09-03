@@ -138,35 +138,6 @@ def _notify_when_auth_backend_claimed(
     return claimed
 
 
-def _notify_when_async_fill_wrapped(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    waiters: int,
-) -> threading.Event:
-    """Set an event after `waiters` async joiners wrap the shared fill Future."""
-    wrapped = threading.Event()
-    guard = threading.Lock()
-    count = 0
-    real_wrap_future = asyncio.wrap_future
-
-    def counting_wrap_future(
-        future: Future[AuthenticationBackend],
-        *,
-        loop: asyncio.AbstractEventLoop | None = None,
-    ) -> asyncio.Future[AuthenticationBackend]:
-        nonlocal count
-        result = real_wrap_future(future, loop=loop)
-        if future is auth_middleware_module._auth_backend_fill:
-            with guard:
-                count += 1
-                if count >= waiters:
-                    wrapped.set()
-        return result
-
-    monkeypatch.setattr(asyncio, "wrap_future", counting_wrap_future)
-    return wrapped
-
-
 def _run_concurrent_calls_during_in_flight_import(
     *,
     load_started: threading.Event,
@@ -707,6 +678,75 @@ class TestAuthModuleLoadOnce:
         assert locations == [str(auth_file.resolve())]
 
     @pytest.mark.asyncio
+    async def test_async_fill_does_not_run_on_event_loop_thread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Async init must complete the shared fill off the event-loop thread."""
+        _install_auth_config(tmp_path, monkeypatch)
+        loop_thread_id = threading.get_ident()
+        fill_thread_ids: list[int] = []
+        real_complete = auth_middleware_module._complete_auth_backend_fill
+
+        def tracking_complete(fut: Future[AuthenticationBackend]) -> AuthenticationBackend:
+            fill_thread_ids.append(threading.get_ident())
+            return real_complete(fut)
+
+        monkeypatch.setattr(auth_middleware_module, "_complete_auth_backend_fill", tracking_complete)
+
+        backend = await get_auth_backend_async()
+
+        assert isinstance(backend, LangGraphAuthBackend)
+        assert backend.auth_instance is not None
+        assert fill_thread_ids
+        assert loop_thread_id not in fill_thread_ids
+
+    @pytest.mark.asyncio
+    async def test_event_loop_sync_waiter_does_not_deadlock_async_fill(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A sync waiter on this loop must not block the worker that owns the fill."""
+        auth_file = _install_auth_config(tmp_path, monkeypatch)
+        locations, load_started, load_release = _block_first_auth_file_spec(monkeypatch)
+        loop_thread_id = threading.get_ident()
+        loop_waiting = threading.Event()
+        errors: list[BaseException] = []
+        real_future_result = Future.result
+
+        def tracking_result(
+            self: Future[AuthenticationBackend],
+            timeout: float | None = None,
+        ) -> AuthenticationBackend:
+            if self is auth_middleware_module._auth_backend_fill and threading.get_ident() == loop_thread_id:
+                loop_waiting.set()
+            return real_future_result(self, timeout)
+
+        monkeypatch.setattr(Future, "result", tracking_result)
+
+        def release_after_loop_waits() -> None:
+            if not loop_waiting.wait(timeout=5):
+                errors.append(TimeoutError("event-loop waiter did not block on shared fill"))
+            load_release.set()
+
+        releaser = threading.Thread(target=release_after_loop_waits)
+        releaser.start()
+        try:
+            async_task = asyncio.create_task(get_auth_backend_async())
+            assert await asyncio.to_thread(load_started.wait, 5)
+            sync_backend = get_auth_backend()
+            async_backend = await asyncio.wait_for(async_task, timeout=5)
+        finally:
+            load_release.set()
+            releaser.join(timeout=5)
+
+        assert errors == []
+        assert not releaser.is_alive()
+        assert not async_task.cancelled()
+        assert sync_backend is async_backend
+        assert isinstance(async_backend, LangGraphAuthBackend)
+        assert async_backend.auth_instance is not None
+        assert locations == [str(auth_file.resolve())]
+
+    @pytest.mark.asyncio
     async def test_concurrent_async_first_misses_load_auth_module_once(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -794,7 +834,6 @@ class TestAuthModuleLoadOnce:
         auth_file = _install_auth_config(tmp_path, monkeypatch)
         locations, load_started, load_release = _block_first_auth_file_spec(monkeypatch)
         all_claimed = _notify_when_auth_backend_claimed(monkeypatch, waiters=3)
-        joiners_wrapped = _notify_when_async_fill_wrapped(monkeypatch, waiters=2)
         sync_backends: list[object] = []
         errors: list[BaseException] = []
 
@@ -812,7 +851,6 @@ class TestAuthModuleLoadOnce:
             cancelled_joiner = asyncio.create_task(get_auth_backend_async())
             surviving_joiner = asyncio.create_task(get_auth_backend_async())
             assert await asyncio.to_thread(all_claimed.wait, 5)
-            assert await asyncio.to_thread(joiners_wrapped.wait, 5)
 
             shared_fill = auth_middleware_module._auth_backend_fill
             assert shared_fill is not None
@@ -824,6 +862,10 @@ class TestAuthModuleLoadOnce:
 
             load_release.set()
             surviving_backend = await asyncio.wait_for(surviving_joiner, timeout=5)
+            leftover = [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
+            if leftover:
+                _done, pending = await asyncio.wait(leftover, timeout=5)
+                assert not pending
         finally:
             load_release.set()
             sync_thread.join(timeout=5)
@@ -931,6 +973,24 @@ class TestAuthModuleLoadOnce:
         assert first_user.identity == "cached-user"
         assert second_user.identity == "cached-user"
         assert first_user.display_name == "Cached User"
+
+    def test_clear_auth_loader_caches_allows_reinitialization(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Clearing loader caches must drop the in-flight Future so a later call reloads."""
+        auth_file = _install_auth_config(tmp_path, monkeypatch)
+        locations = _count_spec_from_file_location(monkeypatch)
+
+        first = get_auth_backend()
+        auth_middleware_module._clear_auth_loader_caches()
+        assert auth_middleware_module._auth_backend_fill is None
+        second = get_auth_backend()
+
+        assert first is not second
+        assert isinstance(second, LangGraphAuthBackend)
+        assert first.auth_instance is not None
+        assert second.auth_instance is not None
+        assert locations == [str(auth_file.resolve()), str(auth_file.resolve())]
 
 
 class TestOnAuthError:
