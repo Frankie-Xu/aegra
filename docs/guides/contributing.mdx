@@ -140,7 +140,7 @@ Visit `http://localhost:2026/docs` to see the API.
 
 ## Database migrations
 
-Aegra uses Alembic for database migrations. Migrations apply automatically on server startup — you only need these commands when creating or debugging migrations.
+Aegra uses Alembic for database migrations. In local and single-pod setups, migrations apply automatically on server startup — you only need these commands when creating or debugging migrations, or when operating a multi-pod deployment.
 
 ```bash
 # Create a new migration
@@ -158,6 +158,8 @@ aegra db history -v
 # Show current version
 aegra db current
 ```
+
+Multi-pod deployments should run `aegra db upgrade` from a single operator/Job before rolling a new version, even when `RUN_MIGRATIONS_ON_STARTUP=false`. Do not let every replica run the upgrade independently. See [Migrations](/guides/deployment#migrations).
 
 ### Making database changes
 

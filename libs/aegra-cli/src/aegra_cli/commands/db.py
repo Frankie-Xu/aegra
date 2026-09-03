@@ -109,6 +109,7 @@ def upgrade() -> None:
         )
     )
 
+    # After load_env_file; a top-level import would freeze settings. See module docstring.
     from aegra_api.core.migrations import run_migrations
 
     _run_alembic(

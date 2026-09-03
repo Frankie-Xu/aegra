@@ -123,16 +123,32 @@ def migration_advisory_lock() -> Iterator[None]:
     Uses ``database_url_sync`` so SQLAlchemy never parses libpq comma-hosts.
     """
     lock_keys = (_AEGRA_MIGRATION_LOCK_KEY1, _AEGRA_MIGRATION_LOCK_KEY2)
-    with psycopg.connect(settings.db.database_url_sync, autocommit=True) as conn:
+    conn = psycopg.connect(settings.db.database_url_sync, autocommit=True)
+    try:
         with conn.cursor() as cur:
             cur.execute(_ADVISORY_LOCK_SQL, lock_keys)
             cur.fetchone()
+        body_error: BaseException | None = None
         try:
             yield
+        except BaseException as exc:
+            body_error = exc
+            raise
         finally:
-            with conn.cursor() as cur:
-                cur.execute(_ADVISORY_UNLOCK_SQL, lock_keys)
-                cur.fetchone()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(_ADVISORY_UNLOCK_SQL, lock_keys)
+                    cur.fetchone()
+            except Exception:
+                if body_error is None:
+                    raise
+                logger.warning("failed to release migration advisory lock after upgrade error")
+    finally:
+        # Best-effort: a close error must not replace an upgrade or unlock error.
+        try:
+            conn.close()
+        except Exception:
+            logger.warning("failed to close migration lock connection")
 
 
 def run_migrations() -> None:
