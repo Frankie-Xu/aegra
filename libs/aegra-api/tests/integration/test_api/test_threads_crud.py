@@ -655,14 +655,16 @@ class TestSearchThreads:
         assert resp.status_code == 200
         assert isinstance(resp.json(), list)
 
-    def test_search_omitted_limit_honors_cap_below_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_search_omitted_limit_honors_cap_below_default(
+        self: "TestSearchThreads", monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setattr(settings.app, "MAX_SEARCH_LIMIT", 10)
         captured: list[int | None] = []
         app = create_test_app(include_runs=False, include_threads=True)
         threads = [_thread_row("thread-1")]
 
         class Session(ThreadSession):
-            async def scalars(self, stmt: Any = None) -> Any:
+            async def scalars(self: "Session", stmt: Any = None) -> Any:
                 if stmt is not None and hasattr(stmt, "_limit"):
                     captured.append(stmt._limit)
                 return await super().scalars(stmt)
@@ -673,14 +675,16 @@ class TestSearchThreads:
         assert resp.status_code == 200
         assert captured == [10]
 
-    def test_search_null_limit_honors_cap_below_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_search_null_limit_honors_cap_below_default(
+        self: "TestSearchThreads", monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setattr(settings.app, "MAX_SEARCH_LIMIT", 10)
         captured: list[int | None] = []
         app = create_test_app(include_runs=False, include_threads=True)
         threads = [_thread_row("thread-1")]
 
         class Session(ThreadSession):
-            async def scalars(self, stmt: Any = None) -> Any:
+            async def scalars(self: "Session", stmt: Any = None) -> Any:
                 if stmt is not None and hasattr(stmt, "_limit"):
                     captured.append(stmt._limit)
                 return await super().scalars(stmt)
