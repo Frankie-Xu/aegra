@@ -33,7 +33,7 @@ from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
 
-# Thread callers (lru_cache concurrent misses). Never acquired on a running loop.
+# Serialize config cache misses, including direct synchronous constructors.
 _auth_thread_lock = threading.RLock()
 # Shared in-flight backend fill. Callers join through get_auth_backend().
 _auth_fill_guard = threading.Lock()
@@ -46,15 +46,11 @@ class _LruCachedFn[T](Protocol):
 
 
 def _lru_fill_once[T](cached_fn: _LruCachedFn[T]) -> T:
-    """Single-flight an lru_cache fill without blocking a running event loop."""
+    """Share a synchronous cache fill across direct constructors and factories."""
     if cached_fn.cache_info().currsize:
         return cached_fn()
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        with _auth_thread_lock:
-            return cached_fn()
-    return cached_fn()
+    with _auth_thread_lock:
+        return cached_fn()
 
 
 class LangGraphUser(BaseUser):
@@ -273,7 +269,7 @@ class LangGraphAuthBackend(AuthenticationBackend):
             user_data: Auth.types.MinimalUserDict = {
                 "identity": "anonymous",
                 "display_name": "Anonymous User",
-                "is_authenticated": True,
+                "is_authenticated": False,
             }
             credentials = AuthCredentials([])
             user = LangGraphUser(user_data)
@@ -386,11 +382,14 @@ def get_auth_backend() -> AuthenticationBackend:
 
 
 async def get_auth_backend_async() -> AuthenticationBackend:
-    """Join get_auth_backend() off-loop so a sync waiter cannot deadlock this loop."""
+    """Initialize on the caller's loop, or asynchronously join another owner's fill."""
     if _get_auth_backend_cached.cache_info().currsize:
         return _get_auth_backend_cached()
-    # shield: cancelling one waiter must not cancel the worker running the shared fill.
-    return await asyncio.shield(asyncio.to_thread(get_auth_backend))
+    fut, owner = _claim_auth_backend_fill()
+    if not owner:
+        return await asyncio.shield(asyncio.wrap_future(fut))
+    # Do not yield while owning the fill: a synchronous loop caller would wait on us.
+    return _complete_auth_backend_fill(fut)
 
 
 def _clear_auth_loader_caches() -> None:
