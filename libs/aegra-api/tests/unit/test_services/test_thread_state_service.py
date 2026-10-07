@@ -175,3 +175,12 @@ def test_project_snapshot_to_thread_fields_skips_tasks_without_interrupts() -> N
     assert result["interrupts"] == {}
     assert result["state_updated_at"] is None
     assert result["config"]["configurable"]["checkpoint_id"] == "cp-empty"
+
+
+def test_project_snapshot_without_checkpoint_returns_empty_thread_fields() -> None:
+    service = ThreadStateService()
+    snapshot = make_snapshot({}, {"configurable": {"thread_id": "thread-123"}}, created_at=None)
+
+    result = service.project_snapshot_to_thread_fields(snapshot, "thread-123")
+
+    assert result == {"values": {}, "interrupts": {}, "config": {}, "state_updated_at": None}

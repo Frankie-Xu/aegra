@@ -4,13 +4,14 @@ import asyncio
 import contextlib
 import json
 import warnings
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 from uuid import uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from langchain_core.runnables import RunnableConfig
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +22,7 @@ from aegra_api.core.auth_handlers import build_auth_context, handle_event
 from aegra_api.core.database import db_manager
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
+from aegra_api.core.orm import ThreadTTL as ThreadTTLORM
 from aegra_api.core.orm import get_session
 from aegra_api.models import (
     Thread,
@@ -29,20 +31,22 @@ from aegra_api.models import (
     ThreadCreate,
     ThreadHistoryRequest,
     ThreadList,
+    ThreadPruneResponse,
     ThreadSearchRequest,
     ThreadState,
     ThreadStateUpdate,
     ThreadStateUpdateResponse,
+    ThreadTTLSpec,
     ThreadUpdate,
     User,
 )
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, AgentProtocolError
-from aegra_api.services.langgraph_service import (
-    create_thread_config,
-    get_langgraph_service,
-)
+from aegra_api.models.search_limit import effective_search_limit
+from aegra_api.services.langgraph_service import create_thread_config, get_langgraph_service
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.services.thread_state_service import ThreadStateService
+from aegra_api.services.thread_ttl import get_thread_ttl_config, prune_expired_threads_for_user
+from aegra_api.utils.jsonb import jsonb_patch, jsonb_shallow_merge
 from aegra_api.utils.run_utils import strip_pinned_config_keys
 
 router = APIRouter(tags=["Threads"], dependencies=auth_dependency)
@@ -193,35 +197,65 @@ async def _load_thread_state_fields(thread: ThreadORM, user: User) -> dict[str, 
     thread_id = str(getattr(thread, "thread_id", ""))
     langgraph_service = get_langgraph_service()
     config: dict[str, Any] = create_thread_config(thread_id, user)
-    try:
-        async with langgraph_service.get_graph(
-            graph_id,
-            config=config,
-            access_context="threads.read",
-            user=user,
-        ) as agent:
-            agent = agent.with_config(config)
-            state_snapshot = await agent.aget_state(config, subgraphs=False)
+    async with contextlib.AsyncExitStack() as stack:
+        try:
+            agent = await stack.enter_async_context(
+                langgraph_service.get_graph(
+                    graph_id,
+                    config=config,
+                    access_context="threads.read",
+                    user=user,
+                )
+            )
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                return empty
+            raise
+        except ValueError:
+            logger.info("thread_graph_unresolved", graph_id=graph_id, thread_id=thread_id)
+            return empty
+
+        runnable_config = cast(RunnableConfig, config)
+        agent = agent.with_config(runnable_config)
+        state_snapshot = await agent.aget_state(runnable_config, subgraphs=False)
         if not state_snapshot:
             return empty
         return thread_state_service.project_snapshot_to_thread_fields(state_snapshot, thread_id)
-    except HTTPException as exc:
-        if exc.status_code == 404:
-            return empty
-        raise
-    except ValueError:
-        logger.info(
-            "Graph '%s' could not be resolved for thread '%s'; returning empty state fields",
-            graph_id,
-            thread_id,
-        )
-        return empty
-    except Exception as e:
-        logger.exception("Failed to retrieve latest state for thread '%s'", thread_id)
-        raise HTTPException(500, "Failed to retrieve thread state") from e
 
 
 # --- Endpoints ---
+
+
+def _resolve_ttl_row(thread_id: str, requested: ThreadTTLSpec | None) -> ThreadTTLORM | None:
+    """Build the thread_ttl row for a new thread, or None when TTL doesn't apply.
+
+    Server config supplies defaults; a request-level ttl overrides per field.
+    Without server config, an explicit request must carry default_ttl.
+    """
+    config = get_thread_ttl_config()
+    if config is None and requested is None:
+        return None
+
+    requested_ttl = requested.default_ttl if requested else None
+    requested_strategy = requested.strategy if requested else None
+
+    if config is not None:
+        ttl_minutes = requested_ttl if requested_ttl is not None else config.default_ttl
+        strategy = requested_strategy or config.strategy
+    else:
+        if requested_ttl is None:
+            raise HTTPException(422, "ttl.default_ttl is required when no server-side TTL default is configured")
+        ttl_minutes = requested_ttl
+        strategy = requested_strategy or "delete"
+
+    now = datetime.now(UTC)
+    return ThreadTTLORM(
+        thread_id=thread_id,
+        strategy=strategy,
+        ttl_minutes=ttl_minutes,
+        created_at=now,
+        expires_at=now + timedelta(minutes=ttl_minutes),
+    )
 
 
 @router.post("/threads", response_model=Thread, responses={**CONFLICT})
@@ -254,6 +288,8 @@ async def create_thread(
             request.metadata = {**(request.metadata or {}), **handler_meta}
 
     thread_id = request.thread_id or str(uuid4())
+    # Resolve before the insert so an invalid ttl request 422s without DB work.
+    ttl_row = _resolve_ttl_row(thread_id, request.ttl)
 
     metadata = request.metadata or {}
     # Always enforce owner from authenticated user
@@ -279,6 +315,10 @@ async def create_thread(
         .returning(ThreadORM)
     )
     created = (await session.scalars(insert_stmt)).first()
+    # Same transaction as the thread insert: thread + ttl commit atomically.
+    # Conflict path skips — an idempotent re-create must not touch the incumbent's TTL.
+    if created is not None and ttl_row is not None:
+        session.add(ttl_row)
     await session.commit()
 
     if created is not None:
@@ -387,18 +427,27 @@ async def update_thread(
         if isinstance(handler_meta, dict):
             request.metadata = {**(request.metadata or {}), **handler_meta}
 
+    # This read is the 404 probe and the ownership check; the merge below does
+    # not read the column into Python, so it cannot lose a concurrent writer's
+    # keys no matter how long this request takes.
     stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
     thread = await session.scalar(stmt)
 
     if not thread:
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
-    thread.updated_at = datetime.now(UTC)
-
+    values: dict[str, Any] = {"updated_at": datetime.now(UTC)}
     if request.metadata:
-        current_metadata = dict(thread.metadata_json or {})
-        current_metadata.update(request.metadata)
-        thread.metadata_json = current_metadata
+        values["metadata_json"] = jsonb_shallow_merge(
+            ThreadORM.metadata_json, jsonb_patch(request.metadata, "metadata_patch")
+        )
+
+    await session.execute(
+        update(ThreadORM)
+        .where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
 
     await session.commit()
     await session.refresh(thread)
@@ -961,6 +1010,26 @@ async def delete_thread(
     return {"status": "deleted"}
 
 
+@router.post("/threads/prune", response_model=ThreadPruneResponse)
+async def prune_threads(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> ThreadPruneResponse:
+    """Immediately apply TTL policies to the caller's expired threads.
+
+    Threads whose TTL has expired are deleted (strategy `delete`) or have
+    their checkpoint history compacted (strategy `keep_latest`). Threads with
+    active runs are skipped and handled once their runs settle.
+    """
+    # Authorization check — pruning is a bulk threads.delete
+    ctx = build_auth_context(user, "threads", "delete")
+    filters = await handle_event(ctx, {})
+    auth_filter = build_metadata_filter(ThreadORM.metadata_json, filters)
+
+    deleted, pruned = await prune_expired_threads_for_user(session, user_id=user.identity, auth_filter=auth_filter)
+    return ThreadPruneResponse(deleted=deleted, pruned=pruned)
+
+
 @router.post("/threads/search", response_model=list[Thread])
 async def search_threads(
     request: ThreadSearchRequest,
@@ -993,7 +1062,7 @@ async def search_threads(
         stmt = stmt.where(ThreadORM.metadata_json.op("@>")(request.metadata))
 
     offset = request.offset or 0
-    limit = request.limit or 20
+    limit = request.limit if request.limit is not None else effective_search_limit()
     column, asc = _resolve_sort(request)
     direction = column.asc() if asc else column.desc()
     # Secondary sort on thread_id keeps offset pagination stable when the

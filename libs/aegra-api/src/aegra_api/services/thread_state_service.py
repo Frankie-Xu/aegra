@@ -98,6 +98,8 @@ class ThreadStateService:
         It must not include ThreadState fields such as next, tasks, or checkpoint.
         """
         thread_state = self.convert_snapshot_to_thread_state(snapshot, thread_id)
+        if thread_state.checkpoint.checkpoint_id is None:
+            return {"values": {}, "interrupts": {}, "config": {}, "state_updated_at": None}
         interrupts: dict[str, Any] = {
             str(task["id"]): task["interrupts"]
             for task in thread_state.tasks
