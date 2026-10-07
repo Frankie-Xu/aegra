@@ -95,7 +95,8 @@ When multiple modes are active, the `event` field tells you which mode each chun
 `interrupt_before` and `interrupt_after` also pause Python graph execution when
 `stream_mode` includes `events`. Node names and the `"*"` wildcard have the same
 meaning as with ordinary streaming. The checkpoint's `next` lists the nodes
-still pending; resume on the same thread with `input=None`.
+still pending. Fetch the thread state and resume on the same thread with
+`input=None` and `checkpoint=state["checkpoint"]`.
 
 ```python
 async for chunk in client.runs.stream(
