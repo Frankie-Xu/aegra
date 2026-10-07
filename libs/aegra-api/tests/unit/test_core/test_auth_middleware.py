@@ -245,7 +245,7 @@ class TestLangGraphAuthBackend:
             credentials, user = result
             assert user.identity == "anonymous"
             assert user.display_name == "Anonymous User"
-            assert user.is_authenticated is True
+            assert user.is_authenticated is False
             assert isinstance(credentials, AuthCredentials)
 
     @pytest.mark.asyncio
@@ -267,6 +267,7 @@ class TestLangGraphAuthBackend:
             credentials, user = result
             assert user.identity == "anonymous"
             assert user.display_name == "Anonymous User"
+            assert user.is_authenticated is False
 
     @pytest.mark.asyncio
     async def test_authenticate_no_handler(self):

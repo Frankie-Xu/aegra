@@ -263,7 +263,7 @@ class TestNoopAuth:
         credentials, user = result
         assert user.identity == "anonymous"
         assert user.display_name == "Anonymous User"
-        assert user.is_authenticated is True
+        assert user.is_authenticated is False
         assert isinstance(credentials, AuthCredentials)
         assert credentials.scopes == []
 
@@ -386,7 +386,9 @@ def _auth_succeeding() -> Auth:
 class TestAuthenticateHttpStatusPassthrough:
     """HTTP-level: handler status/headers reach the Agent Protocol response, not collapse to 401."""
 
-    def _get(self, auth_instance: Auth | None) -> tuple[int, dict[str, object], dict[str, str]]:
+    def _get(
+        self, auth_instance: Auth | None, *, route_calls: list[str] | None = None
+    ) -> tuple[int, dict[str, object], dict[str, str]]:
         backend = LangGraphAuthBackend()
         backend.auth_instance = auth_instance
 
@@ -396,6 +398,8 @@ class TestAuthenticateHttpStatusPassthrough:
 
         @app.get("/protected")
         async def protected(user: User = Depends(require_auth)) -> dict[str, str]:
+            if route_calls is not None:
+                route_calls.append(user.identity)
             return {"identity": user.identity}
 
         with (
@@ -418,6 +422,30 @@ class TestAuthenticateHttpStatusPassthrough:
 
         assert code == status_code
         assert body["message"] == detail
+
+    def test_handler_http_exception_without_status_defaults_to_401(self) -> None:
+        auth = Auth()
+
+        @auth.authenticate
+        async def authenticate(_headers: dict[str, str]) -> dict[str, str]:
+            raise Auth.exceptions.HTTPException()
+
+        code, body, _headers = self._get(auth)
+
+        assert code == 401
+        assert body["message"] == "Unauthorized"
+
+    def test_handler_http_exception_with_success_status_does_not_run_route(self) -> None:
+        route_calls: list[str] = []
+
+        code, body, _headers = self._get(
+            _auth_raising(status_code=200, detail="authentication denied"),
+            route_calls=route_calls,
+        )
+
+        assert code == 200
+        assert body["message"] == "authentication denied"
+        assert route_calls == []
 
     def test_handler_http_exception_headers_reach_client(self) -> None:
         code, body, headers = self._get(
