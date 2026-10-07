@@ -2,13 +2,14 @@
 
 Resolves the bundled alembic.ini from the installed package. Two entry points:
 - ``run_migrations()``: unconditional upgrade. Online ``env.py`` holds a
-  session ``pg_advisory_lock`` so concurrent upgrades serialize. Alembic itself
+  session advisory lock so concurrent upgrades serialize. Alembic itself
   does not take this lock. For ``aegra db upgrade``.
 - ``run_migrations_if_needed()``: lock-free precheck, skips upgrade when
   already at head. FastAPI startup uses this to avoid multi-pod lock contention.
 """
 
 import asyncio
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -28,8 +29,9 @@ logger = structlog.get_logger(__name__)
 # autocommit_block() / CREATE INDEX CONCURRENTLY, which would drop an xact lock.
 _AEGRA_MIGRATION_LOCK_KEY1: int = 0xAE6A
 _AEGRA_MIGRATION_LOCK_KEY2: int = 1
-_ADVISORY_LOCK_SQL: LiteralString = "SELECT pg_advisory_lock(%s, %s)"
+_ADVISORY_LOCK_SQL: LiteralString = "SELECT pg_try_advisory_lock(%s, %s)"
 _ADVISORY_UNLOCK_SQL: LiteralString = "SELECT pg_advisory_unlock(%s, %s)"
+_LOCK_RETRY_INTERVAL_SECONDS: float = 0.1
 
 
 def find_alembic_ini() -> Path:
@@ -118,16 +120,22 @@ def _is_database_up_to_date(cfg: Config) -> bool:
 
 @contextmanager
 def migration_advisory_lock() -> Iterator[None]:
-    """Hold a session ``pg_advisory_lock`` on a dedicated psycopg connection.
+    """Hold a session advisory lock on a dedicated psycopg connection.
 
     Uses ``database_url_sync`` so SQLAlchemy never parses libpq comma-hosts.
     """
     lock_keys = (_AEGRA_MIGRATION_LOCK_KEY1, _AEGRA_MIGRATION_LOCK_KEY2)
     conn = psycopg.connect(settings.db.database_url_sync, autocommit=True)
     try:
-        with conn.cursor() as cur:
-            cur.execute(_ADVISORY_LOCK_SQL, lock_keys)
-            cur.fetchone()
+        # Blocking pg_advisory_lock retains a snapshot that stalls concurrent index builds.
+        # Autocommit try-lock attempts release each snapshot before waiting again.
+        while True:
+            with conn.cursor() as cur:
+                cur.execute(_ADVISORY_LOCK_SQL, lock_keys)
+                row = cur.fetchone()
+            if row is not None and row[0]:
+                break
+            time.sleep(_LOCK_RETRY_INTERVAL_SECONDS)
         body_error: BaseException | None = None
         try:
             yield

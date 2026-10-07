@@ -393,6 +393,7 @@ class TestIsDatabaseUpToDate:
 def _advisory_lock_connection() -> tuple[MagicMock, MagicMock]:
     """psycopg.connect mock for the dedicated session advisory-lock connection."""
     cursor = MagicMock()
+    cursor.fetchone.return_value = (True,)
     cursor_cm = MagicMock()
     cursor_cm.__enter__.return_value = cursor
     cursor_cm.__exit__.return_value = False
@@ -473,9 +474,26 @@ class TestMigrationAdvisoryLock:
         assert (_AEGRA_MIGRATION_LOCK_KEY1, _AEGRA_MIGRATION_LOCK_KEY2) == (0xAE6A, 1)
         cursor = connection.cursor.return_value.__enter__.return_value
         assert cursor.execute.call_args_list[0].args[1] == (0xAE6A, 1)
-        assert cursor.execute.call_args_list[0].args[0] == "SELECT pg_advisory_lock(%s, %s)"
+        assert cursor.execute.call_args_list[0].args[0] == "SELECT pg_try_advisory_lock(%s, %s)"
         assert "pg_advisory_xact_lock" not in cursor.execute.call_args_list[0].args[0]
         connection.close.assert_called_once()
+
+    def test_waits_for_lock_before_running_migrations(self) -> None:
+        connection, order = _lock_connection()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.side_effect = [(False,), (False,), (True,), (True,)]
+
+        with (
+            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
+            patch.object(migrations_mod.time, "sleep", side_effect=lambda _delay: order.append("wait")) as mock_sleep,
+            migrations_mod.migration_advisory_lock(),
+        ):
+            order.append("body")
+
+        assert order == ["lock", "wait", "lock", "wait", "lock", "body", "unlock", "close"]
+        assert mock_sleep.call_count == 2
+        assert connection.cursor.return_value.__exit__.call_count == 4
+        connection.close.assert_called_once_with()
 
     def test_unlocks_when_body_raises(self) -> None:
         """A failed upgrade still releases the session lock."""
@@ -491,6 +509,56 @@ class TestMigrationAdvisoryLock:
 
         assert order == ["lock", "body", "unlock", "close"]
         connection.close.assert_called_once()
+
+    def test_acquisition_failure_closes_connection_without_running_body(self) -> None:
+        connection, cursor = _advisory_lock_connection()
+        acquisition_error = RuntimeError("lock acquisition failed")
+        cursor.execute.side_effect = acquisition_error
+
+        with (
+            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
+            pytest.raises(RuntimeError) as exc_info,
+            migrations_mod.migration_advisory_lock(),
+        ):
+            pytest.fail("migration body must not run without a lock")
+
+        assert exc_info.value is acquisition_error
+        cursor.execute.assert_called_once_with(_ADVISORY_LOCK_SQL, (0xAE6A, 1))
+        connection.close.assert_called_once_with()
+
+    def test_interrupt_releases_lock_and_closes_connection(self) -> None:
+        connection, order = _lock_connection()
+        interrupt = KeyboardInterrupt()
+
+        with (
+            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
+            pytest.raises(KeyboardInterrupt) as exc_info,
+            migrations_mod.migration_advisory_lock(),
+        ):
+            order.append("body")
+            raise interrupt
+
+        assert exc_info.value is interrupt
+        assert order == ["lock", "body", "unlock", "close"]
+        connection.close.assert_called_once_with()
+
+    def test_interrupt_while_waiting_closes_connection_without_running_migrations(self) -> None:
+        connection, order = _lock_connection()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (False,)
+        interrupt = KeyboardInterrupt()
+
+        with (
+            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
+            patch.object(migrations_mod.time, "sleep", side_effect=interrupt),
+            pytest.raises(KeyboardInterrupt) as exc_info,
+            migrations_mod.migration_advisory_lock(),
+        ):
+            pytest.fail("interrupted wait must not run migrations")
+
+        assert exc_info.value is interrupt
+        assert order == ["lock", "close"]
+        connection.close.assert_called_once_with()
 
     def test_upgrade_and_unlock_failure_keeps_upgrade_error(self) -> None:
         """Unlock failure after a failed upgrade must not replace the upgrade error."""
