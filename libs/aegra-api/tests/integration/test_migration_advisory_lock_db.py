@@ -23,7 +23,7 @@ def test_waiting_migration_does_not_block_concurrent_index_build(monkeypatch: py
     suffix = uuid4().hex
     application_name = f"aegra_migration_test_{suffix}"
     table_name = sql.Identifier(f"migration_lock_{suffix}")
-    index_name = sql.Identifier(f"migration_lock_idx_{suffix}")
+    index_name = f"migration_lock_idx_{suffix}"
     lock_url = make_conninfo(database_url, application_name=application_name)
     monkeypatch.setattr(migrations.settings, "db", SimpleNamespace(database_url_sync=lock_url))
     holder_ready = Event()
@@ -35,7 +35,9 @@ def test_waiting_migration_does_not_block_concurrent_index_build(monkeypatch: py
             assert start_index_build.wait(timeout=10), "contending migration never connected"
             connection.execute("SET statement_timeout = '3s'")
             connection.execute(
-                sql.SQL("CREATE INDEX CONCURRENTLY {} ON {} USING gin (metadata)").format(index_name, table_name)
+                sql.SQL("CREATE INDEX CONCURRENTLY {} ON {} USING gin (metadata)").format(
+                    sql.Identifier(index_name), table_name
+                )
             )
 
     def waiting_migration() -> None:
@@ -72,7 +74,7 @@ def test_waiting_migration_does_not_block_concurrent_index_build(monkeypatch: py
                 contender.result(timeout=10)
 
             valid = observer.execute(
-                "SELECT indisvalid FROM pg_index WHERE indexrelid = %s::regclass", (index_name.string,)
+                "SELECT indisvalid FROM pg_index WHERE indexrelid = %s::regclass", (index_name,)
             ).fetchone()
             assert valid == (True,)
         finally:
