@@ -126,6 +126,7 @@ def migration_advisory_lock() -> Iterator[None]:
     """
     lock_keys = (_AEGRA_MIGRATION_LOCK_KEY1, _AEGRA_MIGRATION_LOCK_KEY2)
     conn = psycopg.connect(settings.db.database_url_sync, autocommit=True)
+    operation_failed = False
     try:
         # Blocking pg_advisory_lock retains a snapshot that stalls concurrent index builds.
         # Autocommit try-lock attempts release each snapshot before waiting again.
@@ -147,15 +148,20 @@ def migration_advisory_lock() -> Iterator[None]:
                 with conn.cursor() as cur:
                     cur.execute(_ADVISORY_UNLOCK_SQL, lock_keys)
                     cur.fetchone()
-            except Exception:
+            except BaseException:
                 if body_error is None:
                     raise
                 logger.warning("failed to release migration advisory lock after upgrade error")
+    except BaseException:
+        operation_failed = True
+        raise
     finally:
         # Best-effort: a close error must not replace an upgrade or unlock error.
         try:
             conn.close()
-        except Exception:
+        except BaseException as exc:
+            if not operation_failed and not isinstance(exc, Exception):
+                raise
             logger.warning("failed to close migration lock connection")
 
 

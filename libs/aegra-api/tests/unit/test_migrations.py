@@ -405,8 +405,8 @@ def _advisory_lock_connection() -> tuple[MagicMock, MagicMock]:
 
 def _lock_connection(
     *,
-    unlock_error: Exception | None = None,
-    close_error: Exception | None = None,
+    unlock_error: BaseException | None = None,
+    close_error: BaseException | None = None,
 ) -> tuple[MagicMock, list[str]]:
     """Connection mock that records lock → unlock → close order."""
     order: list[str] = []
@@ -500,12 +500,12 @@ class TestMigrationAdvisoryLock:
         connection, order = _lock_connection()
 
         with (
-            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
             pytest.raises(RuntimeError, match="boom"),
+            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
             migrations_mod.migration_advisory_lock(),
         ):
             order.append("body")
-            raise RuntimeError("boom")
+            MagicMock(side_effect=RuntimeError("boom"))()
 
         assert order == ["lock", "body", "unlock", "close"]
         connection.close.assert_called_once()
@@ -531,12 +531,12 @@ class TestMigrationAdvisoryLock:
         interrupt = KeyboardInterrupt()
 
         with (
-            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
             pytest.raises(KeyboardInterrupt) as exc_info,
+            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
             migrations_mod.migration_advisory_lock(),
         ):
             order.append("body")
-            raise interrupt
+            MagicMock(side_effect=interrupt)()
 
         assert exc_info.value is interrupt
         assert order == ["lock", "body", "unlock", "close"]
@@ -566,13 +566,13 @@ class TestMigrationAdvisoryLock:
         connection, order = _lock_connection(unlock_error=unlock_error)
 
         with (
+            pytest.raises(RuntimeError, match="upgrade boom"),
             patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
             patch.object(migrations_mod.logger, "warning") as mock_warning,
-            pytest.raises(RuntimeError, match="upgrade boom"),
             migrations_mod.migration_advisory_lock(),
         ):
             order.append("body")
-            raise RuntimeError("upgrade boom")
+            MagicMock(side_effect=RuntimeError("upgrade boom"))()
 
         assert order == ["lock", "body", "unlock", "close"]
         connection.close.assert_called_once()
@@ -600,13 +600,13 @@ class TestMigrationAdvisoryLock:
         connection, order = _lock_connection(close_error=RuntimeError("close boom"))
 
         with (
+            pytest.raises(RuntimeError, match="upgrade boom"),
             patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
             patch.object(migrations_mod.logger, "warning") as mock_warning,
-            pytest.raises(RuntimeError, match="upgrade boom"),
             migrations_mod.migration_advisory_lock(),
         ):
             order.append("body")
-            raise RuntimeError("upgrade boom")
+            MagicMock(side_effect=RuntimeError("upgrade boom"))()
 
         assert order == ["lock", "body", "unlock", "close"]
         connection.close.assert_called_once()
@@ -628,6 +628,88 @@ class TestMigrationAdvisoryLock:
 
         assert order == ["lock", "body", "unlock", "close"]
         connection.close.assert_called_once()
+
+    @pytest.mark.parametrize("body_error", [RuntimeError("upgrade failed"), KeyboardInterrupt("upgrade interrupted")])
+    @pytest.mark.parametrize("interrupted_cleanup", ["unlock", "close", "both"])
+    def test_cleanup_interruption_preserves_original_upgrade_error(
+        self, body_error: BaseException, interrupted_cleanup: str
+    ) -> None:
+        connection, order = _lock_connection(
+            unlock_error=KeyboardInterrupt("unlock interrupted") if interrupted_cleanup != "close" else None,
+            close_error=KeyboardInterrupt("close interrupted") if interrupted_cleanup != "unlock" else None,
+        )
+
+        with (
+            pytest.raises((RuntimeError, KeyboardInterrupt)) as exc_info,
+            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
+            migrations_mod.migration_advisory_lock(),
+        ):
+            order.append("body")
+            MagicMock(side_effect=body_error)()
+
+        assert exc_info.value is body_error
+        assert order == ["lock", "body", "unlock", "close"]
+
+    def test_close_interruption_preserves_lock_acquisition_error(self) -> None:
+        connection, cursor = _advisory_lock_connection()
+        acquisition_error = RuntimeError("lock acquisition failed")
+        cursor.execute.side_effect = acquisition_error
+        connection.close.side_effect = KeyboardInterrupt("close interrupted")
+
+        with (
+            pytest.raises((RuntimeError, KeyboardInterrupt)) as exc_info,
+            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
+            migrations_mod.migration_advisory_lock(),
+        ):
+            pytest.fail("migration body must not run without a lock")
+
+        assert exc_info.value is acquisition_error
+        connection.close.assert_called_once_with()
+
+    def test_close_interruption_after_successful_upgrade_is_raised(self) -> None:
+        interrupt = KeyboardInterrupt("close interrupted")
+        connection, order = _lock_connection(close_error=interrupt)
+
+        with (
+            pytest.raises(KeyboardInterrupt) as exc_info,
+            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
+            migrations_mod.migration_advisory_lock(),
+        ):
+            order.append("body")
+
+        assert exc_info.value is interrupt
+        assert order == ["lock", "body", "unlock", "close"]
+
+    def test_unlock_interruption_after_successful_upgrade_is_raised(self) -> None:
+        interrupt = KeyboardInterrupt("unlock interrupted")
+        connection, order = _lock_connection(unlock_error=interrupt)
+
+        with (
+            pytest.raises(KeyboardInterrupt) as exc_info,
+            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
+            migrations_mod.migration_advisory_lock(),
+        ):
+            order.append("body")
+
+        assert exc_info.value is interrupt
+        assert order == ["lock", "body", "unlock", "close"]
+
+    def test_close_interruption_does_not_replace_unlock_error(self) -> None:
+        unlock_error = RuntimeError("unlock failed")
+        connection, order = _lock_connection(
+            unlock_error=unlock_error,
+            close_error=KeyboardInterrupt("close interrupted"),
+        )
+
+        with (
+            pytest.raises((RuntimeError, KeyboardInterrupt)) as exc_info,
+            patch("aegra_api.core.migrations.psycopg.connect", return_value=connection),
+            migrations_mod.migration_advisory_lock(),
+        ):
+            order.append("body")
+
+        assert exc_info.value is unlock_error
+        assert order == ["lock", "body", "unlock", "close"]
 
     def test_online_env_wraps_upgrade_with_advisory_lock(self) -> None:
         """Regression: #548 — lock must live in env.py so CLI and startup share it."""
