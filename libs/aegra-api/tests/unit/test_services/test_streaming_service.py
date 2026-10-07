@@ -482,3 +482,13 @@ class TestStreamingService:
         body = "".join(events)
         assert "event: end" in body
         assert f'{{"status":"{end_status}"}}' in body
+
+    async def test_cleanup_run_drops_the_event_counter(self) -> None:
+        """The counter dict is global and unbounded; a finished run must leave no entry."""
+        service = StreamingService()
+        service.event_counters["run-123"] = 7
+
+        with patch("aegra_api.services.streaming_service.broker_manager"):
+            await service.cleanup_run("run-123")
+
+        assert "run-123" not in service.event_counters
