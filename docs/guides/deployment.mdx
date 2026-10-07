@@ -196,6 +196,8 @@ Two ways to configure the database connection:
 
 By default, Aegra runs `alembic upgrade head` during FastAPI's lifespan startup. The fast path is lock-free: each pod first reads the current revision and skips the upgrade entirely if the database is already at head. When an upgrade does run (`aegra db upgrade`, startup when the database is behind head, or `alembic upgrade`), Aegra holds a PostgreSQL session advisory lock in `alembic/env.py` so concurrent upgrades serialize. Alembic itself does not take this lock. Contenders retry `pg_try_advisory_lock` in autocommit mode so a waiting migration does not retain a snapshot that blocks `CREATE INDEX CONCURRENTLY`.
 
+Each migration process uses one additional psycopg connection for the lock, including while waiting. The connection closes when the upgrade succeeds, fails, or is interrupted.
+
 For single-pod and dev setups (`aegra dev`, `aegra up`, single docker-compose service) this is what you want and you do not need to run migrations manually.
 
 ### Multi-pod (Kubernetes, etc.)
