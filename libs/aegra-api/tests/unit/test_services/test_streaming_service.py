@@ -1,6 +1,7 @@
 """Unit tests for streaming_service module"""
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from typing import Any
@@ -10,6 +11,7 @@ import pytest
 
 from aegra_api.models import Run
 from aegra_api.services.broker import BrokerManager
+from aegra_api.services.redis_broker import RedisBrokerManager
 from aegra_api.services.streaming_service import StreamingService
 
 
@@ -435,6 +437,81 @@ class TestStreamingService:
         body = "".join(events)
         assert "event: end" in body
         assert '{"status":"success"}' in body
+        assert manager.get_broker(run.run_id) is None
+
+    async def test_repeated_rejoin_after_sweep_does_not_recreate_brokers(self) -> None:
+        """Rejoining removed runs must leave the broker registry empty."""
+        service = StreamingService()
+        manager = BrokerManager()
+
+        with patch("aegra_api.services.streaming_service.broker_manager", manager):
+            for index in range(5):
+                run = _run(run_id=f"run-{index}")
+                broker = manager.get_or_create_broker(run.run_id)
+                await broker.put(f"{run.run_id}_event_1", ("end", {"status": "success"}))
+                manager.remove_broker(run.run_id)
+
+                for _ in range(2):
+                    events = await asyncio.wait_for(_drain(service, run, last_event_id="-1"), timeout=1.0)
+                    assert len(events) == 1
+                    assert events[0].startswith("event: end")
+                    assert manager.get_broker(run.run_id) is None
+
+            assert manager._brokers == {}
+
+    async def test_rejoin_after_acknowledging_end_emits_one_end(self) -> None:
+        """An acknowledged buffered end still closes a fresh SSE connection."""
+        service = StreamingService()
+        run = _run()
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker(run.run_id)
+        await broker.put("run-123_event_1", ("values", {"a": 1}))
+        await broker.put("run-123_event_2", ("end", {"status": "success"}))
+
+        with patch("aegra_api.services.streaming_service.broker_manager", manager):
+            events = await asyncio.wait_for(_drain(service, run, last_event_id="run-123_event_2"), timeout=1.0)
+
+        assert len(events) == 1
+        assert events[0].startswith("event: end")
+        assert '{"status":"success"}' in events[0]
+
+    @pytest.mark.parametrize("had_local_broker", [False, True])
+    @pytest.mark.parametrize("last_event_id", ["-1", "run-123_event_2"])
+    @pytest.mark.parametrize("buffer_expired", [False, True])
+    async def test_terminal_redis_rejoin_replays_without_caching_broker(
+        self, had_local_broker: bool, last_event_id: str, buffer_expired: bool
+    ) -> None:
+        """Redis replay survives local cleanup and works on another instance."""
+        service = StreamingService()
+        run = _run()
+        manager = RedisBrokerManager()
+        if had_local_broker:
+            manager.get_or_create_broker(run.run_id)
+            manager.cleanup_broker(run.run_id)
+        messages = [
+            json.dumps({"event_id": "run-123_event_1", "payload": ["values", {"a": 1}]}),
+            json.dumps({"event_id": "run-123_event_2", "payload": ["end", {"status": "success"}]}),
+        ]
+        client = MagicMock()
+        client.lrange = AsyncMock(return_value=[] if buffer_expired else messages)
+
+        with (
+            patch("aegra_api.services.streaming_service.broker_manager", manager),
+            patch("aegra_api.services.redis_broker.redis_manager.get_client", return_value=client),
+        ):
+            events = await asyncio.wait_for(_drain(service, run, last_event_id=last_event_id), timeout=1.0)
+            assert service.is_run_streaming(run.run_id) is False
+
+        assert len([event for event in events if event.startswith("event: end")]) == 1
+        if not buffer_expired and last_event_id == "-1":
+            assert len(events) == 2
+            assert events[0].startswith("event: values")
+            assert "id: run-123_event_2" in events[1]
+        else:
+            assert len(events) == 1
+        assert manager.get_broker(run.run_id) is None
+        assert manager._brokers == {}
+        client.lrange.assert_awaited_once()
 
     async def test_rejoin_finished_run_does_not_duplicate_replayed_end(self) -> None:
         """If replay already includes end, do not emit a second terminal event."""

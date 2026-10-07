@@ -46,49 +46,52 @@ def _app_with_finished_run(run_orm: RunORM) -> tuple[FastAPI, DummySessionBase]:
     return app, Session()
 
 
-async def _read_sse_body(resp: httpx.Response, *, timeout: float = 2.0) -> str:
-    """Read SSE bytes until `end` or the stream closes. Fail fast on hang."""
-
-    async def _consume() -> str:
-        body = bytearray()
-        async for chunk in resp.aiter_bytes():
-            body.extend(chunk)
-            if b"event: end" in body:
-                return bytes(body).decode()
-        return bytes(body).decode()
-
-    return await asyncio.wait_for(_consume(), timeout=timeout)
-
-
 @pytest.mark.asyncio
-async def test_stream_emits_end_when_rejoining_finished_run_with_last_event_id() -> None:
+@pytest.mark.parametrize("status", ["success", "error", "interrupted"])
+@pytest.mark.parametrize("broker_state", ["missing", "buffered_end", "acknowledged_end", "swept"])
+async def test_stream_emits_end_when_rejoining_finished_run_with_last_event_id(status: str, broker_state: str) -> None:
     """GET /stream on a terminal run with Last-Event-ID must emit end and close.
 
     After restart the in-memory broker is gone. The header-free path already
     emits end; the JS SDK always sends Last-Event-ID (defaulting to -1) and
     used to hang on heartbeats instead.
     """
-    app, session = _app_with_finished_run(_finished_run_orm(status="success"))
+    run = _finished_run_orm(status=status)
+    app, session = _app_with_finished_run(run)
     manager = BrokerManager()
+    last_event_id = "-1"
+    if broker_state != "missing":
+        broker = manager.get_or_create_broker(run.run_id)
+        await broker.put(f"{run.run_id}_event_1", ("values", {"a": 1}))
+        await broker.put(f"{run.run_id}_event_2", ("end", {"status": status}))
+        if broker_state == "swept":
+            manager.remove_broker(run.run_id)
+        elif broker_state == "acknowledged_end":
+            last_event_id = f"{run.run_id}_event_2"
 
     with (
         patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(session)),
         patch("aegra_api.services.streaming_service.broker_manager", manager),
     ):
         transport = httpx.ASGITransport(app=app)
-        async with (
-            httpx.AsyncClient(transport=transport, base_url="http://test", timeout=2.0) as client,
-            client.stream(
-                "GET",
-                "/threads/test-thread-123/runs/test-run-123/stream",
-                headers={"Accept": "text/event-stream", "Last-Event-ID": "-1"},
-            ) as resp,
-        ):
-            assert resp.status_code == 200
-            text = await _read_sse_body(resp)
-
-    assert "event: end" in text
-    assert '{"status":"success"}' in text
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            for _ in range(2):
+                resp = await asyncio.wait_for(
+                    client.get(
+                        "/threads/test-thread-123/runs/test-run-123/stream",
+                        headers={"Accept": "text/event-stream", "Last-Event-ID": last_event_id},
+                    ),
+                    timeout=2.0,
+                )
+                assert resp.status_code == 200
+                assert resp.text.count("event: end") == 1
+                assert f'{{"status":"{status}"}}' in resp.text
+                if broker_state in {"missing", "swept"}:
+                    assert manager.get_broker(run.run_id) is None
+                if broker_state == "buffered_end":
+                    assert "event: values" in resp.text
+                else:
+                    assert "event: values" not in resp.text
 
 
 @pytest.mark.asyncio
@@ -98,16 +101,17 @@ async def test_stream_header_free_terminal_run_still_emits_end() -> None:
 
     with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(session)):
         transport = httpx.ASGITransport(app=app)
-        async with (
-            httpx.AsyncClient(transport=transport, base_url="http://test", timeout=2.0) as client,
-            client.stream(
-                "GET",
-                "/threads/test-thread-123/runs/test-run-123/stream",
-                headers={"Accept": "text/event-stream"},
-            ) as resp,
-        ):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await asyncio.wait_for(
+                client.get(
+                    "/threads/test-thread-123/runs/test-run-123/stream",
+                    headers={"Accept": "text/event-stream"},
+                ),
+                timeout=2.0,
+            )
             assert resp.status_code == 200
-            text = await _read_sse_body(resp)
+            text = resp.text
 
     assert text.startswith("event: end")
+    assert text.count("event: end") == 1
     assert '{"status":"success"}' in text

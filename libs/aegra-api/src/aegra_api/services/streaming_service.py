@@ -14,18 +14,13 @@ from aegra_api.utils import extract_event_sequence
 
 logger = structlog.getLogger(__name__)
 
-# Same set as run_waiters.TERMINAL_STATES — kept local to avoid importing that
-# module (run_waiters → executor → local_executor → streaming_service).
+# Redis worker initialization imports this service before executor is ready.
+# Keep terminal statuses local to avoid the run_waiters -> executor cycle.
 _TERMINAL_STATUSES = frozenset({"success", "error", "interrupted"})
 
 
 def _is_end_sse(sse_event: str) -> bool:
     return sse_event.startswith("event: end")
-
-
-def _terminal_end_status(run_status: str) -> str:
-    """Match the header-free short-circuit in ``stream_run``."""
-    return "error" if run_status == "error" else run_status
 
 
 class StreamingService:
@@ -122,11 +117,10 @@ class StreamingService:
                 replayed_end = replayed_end or _is_end_sse(sse_event)
                 yield sse_event
 
-            # Broker may be gone after restart/cleanup. Don't aiter() an empty
-            # unfinished broker created by replay — that hangs (#472).
+            # Persisted terminal status closes a rejoin even after replay expires.
             if run.status in _TERMINAL_STATUSES:
                 if not replayed_end:
-                    yield create_end_event(status=_terminal_end_status(run.status))
+                    yield create_end_event(status=run.status)
                 return
 
             # Stream live events if run is still active
@@ -152,7 +146,9 @@ class StreamingService:
         Yields (event_id, sse_event) tuples so the caller can track
         the highest replayed sequence for live deduplication.
         """
-        broker = broker_manager.get_or_create_broker(run_id)
+        broker = broker_manager.get_broker(run_id, for_replay=True)
+        if broker is None:
+            return
         stored_events = await broker.replay(last_event_id)
 
         for event_id, raw_event in stored_events:
