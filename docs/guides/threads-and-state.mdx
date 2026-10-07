@@ -63,9 +63,10 @@ which also includes `next`, `tasks`, and checkpoint identifiers.
 
 For a thread with no checkpoint, `values`, `interrupts`, and `config` are empty
 objects and `state_updated_at` is null, including when the thread already has a
-`graph_id`. If its graph is no longer available, GET still returns the thread
-record with these empty defaults. Checkpoint read failures follow the normal
-API error handling rather than returning an empty successful response.
+`graph_id`. If its `graph_id` is no longer registered, GET still returns the thread
+record with these empty defaults. Registered graph factory construction errors
+and checkpoint read failures follow the normal API error handling rather than
+returning an empty successful response.
 Create, list, search, and patch responses currently use empty defaults; this
 checkpoint projection is loaded on the by-ID GET endpoint.
 

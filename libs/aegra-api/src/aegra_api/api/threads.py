@@ -184,7 +184,7 @@ def _empty_thread_state_fields() -> dict[str, Any]:
 async def _load_thread_state_fields(thread: ThreadORM, user: User) -> dict[str, Any]:
     """Load Thread-contract fields from the latest checkpoint.
 
-    A missing checkpoint or unresolvable graph is an empty projection, not a 404.
+    A missing checkpoint or unregistered graph is an empty projection, not a 404.
     """
     empty = _empty_thread_state_fields()
     thread_metadata = getattr(thread, "metadata_json", None) or {}
@@ -196,25 +196,17 @@ async def _load_thread_state_fields(thread: ThreadORM, user: User) -> dict[str, 
 
     thread_id = str(getattr(thread, "thread_id", ""))
     langgraph_service = get_langgraph_service()
-    config: dict[str, Any] = create_thread_config(thread_id, user)
-    async with contextlib.AsyncExitStack() as stack:
-        try:
-            agent = await stack.enter_async_context(
-                langgraph_service.get_graph(
-                    graph_id,
-                    config=config,
-                    access_context="threads.read",
-                    user=user,
-                )
-            )
-        except HTTPException as exc:
-            if exc.status_code == 404:
-                return empty
-            raise
-        except ValueError:
-            logger.info("thread_graph_unresolved", graph_id=graph_id, thread_id=thread_id)
-            return empty
+    if graph_id not in langgraph_service.list_graphs():
+        logger.info("thread_graph_unresolved", graph_id=graph_id, thread_id=thread_id)
+        return empty
 
+    config: dict[str, Any] = create_thread_config(thread_id, user)
+    async with langgraph_service.get_graph(
+        graph_id,
+        config=config,
+        access_context="threads.read",
+        user=user,
+    ) as agent:
         runnable_config = cast(RunnableConfig, config)
         agent = agent.with_config(runnable_config)
         state_snapshot = await agent.aget_state(runnable_config, subgraphs=False)

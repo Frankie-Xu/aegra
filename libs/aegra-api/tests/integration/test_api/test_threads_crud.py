@@ -10,11 +10,15 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from langgraph.types import StateSnapshot
+from langgraph_sdk.runtime import ServerRuntime
 from psycopg import Error as PsycopgError
 from sqlalchemy.dialects import postgresql
 
 from aegra_api.api import threads as threads_module
+from aegra_api.core.database import db_manager
 from aegra_api.core.orm import get_session as core_get_session
+from aegra_api.services.graph_factory import classify_factory, clear_factory_registry
+from aegra_api.services.langgraph_service import LangGraphService
 from aegra_api.settings import settings
 from tests.fixtures.clients import create_test_app, make_client
 from tests.fixtures.database import (
@@ -472,6 +476,7 @@ class TestGetThread:
 
         with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
             mock_service = mock_get_service.return_value
+            mock_service.list_graphs.return_value = {"test-graph": "fixture.py"}
             mock_service.get_graph = create_get_graph_mock(return_value=mock_agent)
 
             resp = client.get("/threads/test-123")
@@ -505,6 +510,7 @@ class TestGetThread:
 
         with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
             mock_service = mock_get_service.return_value
+            mock_service.list_graphs.return_value = {"test-graph": "fixture.py"}
             mock_service.get_graph = create_get_graph_mock(return_value=mock_agent)
 
             resp = client.get("/threads/test-123")
@@ -533,11 +539,54 @@ class TestGetThread:
         mock_agent.with_config = Mock(return_value=mock_agent)
 
         with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
+            mock_get_service.return_value.list_graphs.return_value = {"test-graph": "fixture.py"}
             mock_get_service.return_value.get_graph = create_get_graph_mock(return_value=mock_agent)
             resp = client.get("/threads/test-123")
 
         assert resp.status_code == (404 if isinstance(error, HTTPException) else 500)
         assert '"values"' not in resp.text
+
+    @pytest.mark.parametrize("error", [ValueError("factory construction failed"), HTTPException(404, "factory denied")])
+    def test_get_thread_registered_factory_construction_errors_propagate(
+        self, error: Exception, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app = create_test_app(include_runs=False, include_threads=True)
+        graph_id = "thread-fields-failing-factory"
+        thread = _thread_row("test-123", metadata={"graph_id": graph_id})
+        runtimes: list[ServerRuntime] = []
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> object:
+                return thread
+
+        def factory(runtime: ServerRuntime) -> Any:
+            runtimes.append(runtime)
+            raise error
+
+        service = LangGraphService()
+        service._graph_registry[graph_id] = {"file_path": "fixture.py", "export_name": "graph"}
+        service._graph_factories[graph_id] = factory
+        monkeypatch.setattr(db_manager, "get_checkpointer", lambda: None)
+        monkeypatch.setattr(db_manager, "get_store", lambda: None)
+        monkeypatch.setattr(threads_module, "get_langgraph_service", lambda: service)
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        classify_factory(factory, graph_id)
+        try:
+            resp = client.get("/threads/test-123")
+        finally:
+            clear_factory_registry(graph_id)
+
+        assert len(runtimes) == 1
+        assert runtimes[0].access_context == "threads.read"
+        assert runtimes[0].user.identity == "test-user"
+        assert resp.status_code == (404 if isinstance(error, HTTPException) else 500)
+        assert '"values"' not in resp.text
+        if isinstance(error, HTTPException):
+            assert resp.json()["detail"] == "factory denied"
+        else:
+            assert "factory construction failed" not in resp.text
 
     def test_get_thread_returns_empty_state_fields_when_graph_not_found(self) -> None:
         """Unresolvable graph_id must not 500 the thread record."""
@@ -553,7 +602,7 @@ class TestGetThread:
 
         with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
             mock_service = mock_get_service.return_value
-            mock_service.get_graph = create_get_graph_mock(side_effect=ValueError("Graph not found: missing-graph"))
+            mock_service.list_graphs.return_value = {}
 
             resp = client.get("/threads/test-123")
 
@@ -561,6 +610,7 @@ class TestGetThread:
         data = resp.json()
         assert data["thread_id"] == "test-123"
         assert data["metadata"]["graph_id"] == "missing-graph"
+        mock_service.get_graph.assert_not_called()
         assert data["values"] == {}
         assert data["interrupts"] == {}
         assert data["config"] == {}
@@ -655,6 +705,7 @@ class TestGetThread:
 
         with patch("aegra_api.api.threads.get_langgraph_service") as mock_get_service:
             mock_service = mock_get_service.return_value
+            mock_service.list_graphs.return_value = {"test-graph": "fixture.py"}
             mock_service.get_graph = create_get_graph_mock(side_effect=RuntimeError("secret boom"))
 
             resp = client.get("/threads/test-123")
